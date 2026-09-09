@@ -1,0 +1,6 @@
+必选依赖：
+PySide6>=6.5
+py7zr>=0.21
+send2trash>=1.8
+可选依赖:
+rarfile>=4.1

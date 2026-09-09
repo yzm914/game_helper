@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+passwords.json
+app_config.json
+dist/
+build/
+*.spec
