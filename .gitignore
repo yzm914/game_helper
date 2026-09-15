@@ -1,7 +1,17 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# 应用配置与密码（不提交）
 passwords.json
 app_config.json
-dist/
+
+# 打包产物
 build/
+dist/
 *.spec
+
+# 测试输出
+test_output/

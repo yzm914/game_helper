@@ -1,7 +1,6 @@
 """
-批量解压工具 v15.0
-新增：配置记忆（目标目录、添加文件/文件夹初始目录）
-其余功能与 v14.2 相同。
+批量解压工具 v24.0
+重构重点：分卷组原子处理、递归扫描完整目录树、安全的目录整理
 """
 
 import sys
@@ -11,10 +10,12 @@ import subprocess
 import zipfile
 import tarfile
 import json
+import base64
+import ctypes
 from pathlib import Path
 import re
 
-from PySide6.QtCore import Qt, QThread, Signal, QDir
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -30,6 +31,66 @@ try:
     HAS_PY7ZR = True
 except ImportError:
     HAS_PY7ZR = False
+
+try:
+    from send2trash import send2trash
+    HAS_SEND2TRASH = True
+except ImportError:
+    HAS_SEND2TRASH = False
+
+# ---------- 密码加密（Windows DPAPI - Crypt32.dll） ----------
+def _dpapi_encrypt(data: bytes) -> bytes:
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [('cbData', ctypes.c_uint32),
+                    ('pbData', ctypes.POINTER(ctypes.c_ubyte))]
+    crypt32 = ctypes.windll.crypt32
+    data_buffer = ctypes.create_string_buffer(data, len(data))
+    in_blob = DATA_BLOB(len(data), ctypes.cast(data_buffer, ctypes.POINTER(ctypes.c_ubyte)))
+    out_blob = DATA_BLOB()
+    ok = crypt32.CryptProtectData(ctypes.byref(in_blob), "BatchExtractor",
+                                  None, None, None, 0, ctypes.byref(out_blob))
+    if not ok:
+        raise RuntimeError("CryptProtectData failed")
+    try:
+        result = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        if out_blob.pbData:
+            ctypes.windll.kernel32.LocalFree(out_blob.pbData)
+    return result
+
+def _dpapi_decrypt(data: bytes) -> bytes:
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [('cbData', ctypes.c_uint32),
+                    ('pbData', ctypes.POINTER(ctypes.c_ubyte))]
+    crypt32 = ctypes.windll.crypt32
+    data_buffer = ctypes.create_string_buffer(data, len(data))
+    in_blob = DATA_BLOB(len(data), ctypes.cast(data_buffer, ctypes.POINTER(ctypes.c_ubyte)))
+    out_blob = DATA_BLOB()
+    ok = crypt32.CryptUnprotectData(ctypes.byref(in_blob), "BatchExtractor",
+                                    None, None, None, 0, ctypes.byref(out_blob))
+    if not ok:
+        raise RuntimeError("CryptUnprotectData failed")
+    try:
+        result = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        if out_blob.pbData:
+            ctypes.windll.kernel32.LocalFree(out_blob.pbData)
+    return result
+
+def encrypt_text(text: str) -> str:
+    if sys.platform == 'win32':
+        encrypted = _dpapi_encrypt(text.encode('utf-8'))
+        return base64.b64encode(encrypted).decode('ascii')
+    else:
+        return base64.b64encode(text.encode('utf-8')).decode('ascii')
+
+def decrypt_text(encoded: str) -> str:
+    raw = base64.b64decode(encoded)
+    if sys.platform == 'win32':
+        decrypted = _dpapi_decrypt(raw)
+        return decrypted.decode('utf-8')
+    else:
+        return raw.decode('utf-8')
 
 # ---------- 文件类型识别 ----------
 def detect_archive_type_by_magic(file_path: Path):
@@ -91,6 +152,22 @@ def is_split_main(path: Path) -> bool:
     if m:
         return True
     return False
+
+def is_zip_split_volume(path: Path) -> bool:
+    name = path.name.lower()
+    return re.search(r'\.z\d{2}$', name) is not None
+
+def find_zip_volume_files(main_zip_path: Path) -> list:
+    """返回与主 zip 文件相关的所有分卷文件（不区分大小写）"""
+    parent = main_zip_path.parent
+    stem = main_zip_path.stem.lower()
+    volumes = []
+    for f in parent.iterdir():
+        if f.is_file():
+            fn = f.name.lower()
+            if fn == stem + '.zip' or re.match(re.escape(stem) + r'\.z\d{2}$', fn):
+                volumes.append(f)
+    return volumes
 
 # ---------- 查找外部工具 ----------
 def find_7z():
@@ -317,48 +394,53 @@ def unique_dir(base_path: Path) -> Path:
             return candidate
         counter += 1
 
+def safe_delete(file_path: Path, use_trash: bool = True):
+    if use_trash and HAS_SEND2TRASH:
+        send2trash(str(file_path))
+    else:
+        if file_path.is_file():
+            file_path.unlink()
+        elif file_path.is_dir():
+            shutil.rmtree(file_path)
+
 # ---------- 任务模型 ----------
-class ExtractJob:
-    def __init__(self, archive_path: Path, relative_parent: Path = Path('.'), is_intermediate=False):
-        self.archive_path = archive_path
+class ArchiveTask:
+    def __init__(self, main_file: Path, relative_parent: Path = Path('.'), volumes: list = None):
+        self.main_file = main_file
         self.relative_parent = relative_parent
-        self.is_intermediate = is_intermediate
+        self.volumes = volumes if volumes is not None else [main_file]
+        self.is_split = len(self.volumes) > 1
 
-# ---------- 扫描函数（模块级） ----------
-def scan_archives_in_folder(folder_path: Path):
-    jobs = []
-    base = folder_path.resolve()
-    for root, dirs, files in os.walk(base):
-        root_path = Path(root)
+# ---------- 扫描函数 ----------
+def scan_archives_recursive(root: Path, base_for_rel: Path = None) -> list:
+    """递归扫描 root 下所有压缩包，返回 ArchiveTask 列表，跳过分卷后续卷"""
+    if base_for_rel is None:
+        base_for_rel = root
+    root_res = root.resolve()
+    base_res = base_for_rel.resolve()
+    tasks = []
+    for dirpath, dirs, files in os.walk(root):
+        dir_path = Path(dirpath)
         for f in files:
-            fp = root_path / f
-            if is_archive(fp) and not is_split_volume(fp):
-                rel_parent = root_path.relative_to(base)
-                jobs.append(ExtractJob(fp, rel_parent, is_intermediate=False))
-    return jobs
-
-def scan_archives_with_magic(folder_path: Path, base_for_rel: Path):
-    jobs = []
-    try:
-        entries = list(folder_path.iterdir())
-    except Exception:
-        return jobs
-    base_resolved = Path(base_for_rel).resolve()
-    for entry in entries:
-        if entry.is_file():
-            fp = entry
-            if is_archive(fp) and not is_split_volume(fp):
-                rel_parent = entry.parent.relative_to(base_resolved)
-                jobs.append(ExtractJob(fp, rel_parent, is_intermediate=False))
+            fp = dir_path / f
+            if is_zip_split_volume(fp):   # 跳过 .z01 等后续卷
                 continue
-            magic_type = detect_archive_type_by_magic(fp)
-            if magic_type and not is_split_volume(fp):
-                rel_parent = entry.parent.relative_to(base_resolved)
-                job = ExtractJob(fp, rel_parent, is_intermediate=False)
-                job.magic_type = magic_type
-                job.is_disguised = True
-                jobs.append(job)
-    return jobs
+            if is_archive(fp) or detect_archive_type_by_magic(fp):
+                # 确定相对父目录
+                try:
+                    rel_parent = fp.parent.relative_to(base_res)
+                except ValueError:
+                    rel_parent = Path('.')
+                # 检查是否是旧式 ZIP 分卷主文件
+                if fp.name.lower().endswith('.zip'):
+                    vols = find_zip_volume_files(fp)
+                    if len(vols) > 1:
+                        tasks.append(ArchiveTask(fp, rel_parent, vols))
+                    else:
+                        tasks.append(ArchiveTask(fp, rel_parent, [fp]))
+                else:
+                    tasks.append(ArchiveTask(fp, rel_parent, [fp]))
+    return tasks
 
 # ---------- 密码管理对话框 ----------
 class PasswordManagerDialog(QDialog):
@@ -388,7 +470,7 @@ class PasswordManagerDialog(QDialog):
         layout.addWidget(button_box)
 
     def add_password(self):
-        text, ok = QInputDialog.getText(self, "添加密码", "请输入密码（明文存储）:")
+        text, ok = QInputDialog.getText(self, "添加密码", "请输入密码（加密存储）:")
         if ok and text.strip():
             self.list_widget.addItem(text.strip())
 
@@ -399,381 +481,347 @@ class PasswordManagerDialog(QDialog):
     def get_passwords(self):
         return [self.list_widget.item(i).text() for i in range(self.list_widget.count())]
 
-# ---------- 后台工作线程 ----------
+# ---------- 工作线程 ----------
 class ExtractWorker(QThread):
     log_signal = Signal(str)
     status_signal = Signal(int, str)
     progress_signal = Signal(int)
     finished_signal = Signal()
+    summary_signal = Signal(dict)
 
     def __init__(self, jobs, target_root, passwords, strategy='B',
-                 recursive=False, smart_flatten=True, delete_intermediate=True,
-                 global_flatten=True, max_depth=10, parent=None):
+                 recursive=True, smart_flatten=True, delete_intermediate=True,
+                 global_flatten=True, max_depth=10, conflict_policy='keep',
+                 recursion_mode='strict', use_trash=True, parent=None):
         super().__init__(parent)
-        self.jobs = jobs
-        self.target_root = target_root
+        # jobs 是 (task, row) 元组列表
+        valid_jobs = []
+        for item in jobs:
+            if isinstance(item, (tuple, list)) and len(item) == 2 \
+                    and isinstance(item[0], ArchiveTask) and isinstance(item[1], int):
+                valid_jobs.append((item[0], item[1]))
+        self.jobs = valid_jobs
+        self.tasks = [job for job, _ in valid_jobs]
+
+        self.target_root = Path(target_root)
         self.passwords = passwords
         self.strategy = strategy
         self.recursive = recursive
-        self.smart_flatten = (strategy == 'B') and smart_flatten
+        self.smart_flatten = smart_flatten          # 不再使用
         self.delete_intermediate = delete_intermediate
-        self.global_flatten = (strategy == 'B') and global_flatten
+        self.global_flatten = global_flatten        # 不再使用
         self.max_depth = max_depth
+        self.conflict_policy = conflict_policy
+        self.recursion_mode = recursion_mode
+        self.use_trash = use_trash
         self._is_cancelled = False
         self.seen_archives = set()
-        self.force_try_files = set()
-        self.failed_archives = set()
+        self.failed_archives = {}
+        self.initial_top_dirs = set()               # 记录每个初始任务的实际顶层目录
 
     def cancel(self):
         self._is_cancelled = True
 
-    # ---------- 目录操作核心 ----------
-    def _move_content(self, src_dir: Path, dst_dir: Path):
-        if not src_dir.exists():
-            return
-        dst_dir.mkdir(parents=True, exist_ok=True)
-
+    # ---------- 目录合并辅助 ----------
+    def _move_all_contents(self, src_dir: Path, dst_dir: Path):
+        """将 src_dir 中所有条目移动到 dst_dir，按冲突策略处理"""
         for item in list(src_dir.iterdir()):
             target = dst_dir / item.name
-            try:
-                if not target.exists():
+            if not target.exists():
+                try:
                     shutil.move(str(item), str(target))
-                    self.log_signal.emit(f"移动: {item.name}")
-                else:
-                    if item.is_dir() and target.is_dir():
-                        self._move_content(item, target)
-                    else:
-                        self.log_signal.emit(f"冲突跳过（保留目标）: {item.name}")
-            except Exception as e:
-                self.log_signal.emit(f"移动失败 {item.name}: {e}")
-
-        try:
-            if not any(src_dir.iterdir()):
-                src_dir.rmdir()
-                self.log_signal.emit(f"已删除空目录: {src_dir}")
+                except Exception as e:
+                    self.log_signal.emit(f"移动失败 {item.name}: {e}")
             else:
-                self.log_signal.emit(f"警告：源目录未清空，保留: {src_dir}")
-        except OSError as e:
-            self.log_signal.emit(f"删除源目录失败 {src_dir}: {e}")
+                if item.is_dir() and target.is_dir():
+                    self._move_all_contents(item, target)
+                else:
+                    if self.conflict_policy == 'merge_skip':
+                        try:
+                            safe_delete(item, use_trash=self.use_trash)
+                        except Exception as e:
+                            self.log_signal.emit(f"丢弃同名失败 {item.name}: {e}")
+                    elif self.conflict_policy == 'merge_rename':
+                        new_target = self._rename_target(dst_dir, item.name)
+                        try:
+                            shutil.move(str(item), str(new_target))
+                        except Exception as e:
+                            self.log_signal.emit(f"重命名移动失败 {item.name}: {e}")
+                    elif self.conflict_policy == 'overwrite':
+                        try:
+                            if target.is_dir():
+                                shutil.rmtree(target)
+                            else:
+                                target.unlink()
+                            shutil.move(str(item), str(target))
+                        except Exception as e:
+                            self.log_signal.emit(f"覆盖移动失败 {item.name}: {e}")
+                    # 'keep' 策略：保留目标，源不动
 
-    def _smart_flatten_inner(self, dir_path: Path):
-        if not dir_path.exists():
+    def _rename_target(self, dst_dir: Path, filename: str) -> Path:
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix
+        counter = 1
+        while True:
+            new_name = f"{stem}({counter}){suffix}"
+            candidate = dst_dir / new_name
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    # ---------- 包装目录折叠（排除初始任务顶层目录） ----------
+    def _fold_wrapper_dirs(self, root: Path):
+        """
+        循环折叠所有“仅含一个子目录且无文件”的包装目录，直到无变化。
+        不折叠初始任务顶层目录和根目录本身。
+        """
+        if not root.exists():
             return
+
         changed = True
         while changed:
             changed = False
-            try:
+            # 收集所有目录（自底向上）
+            all_dirs = []
+            for dirpath, dirnames, filenames in os.walk(root):
+                for d in dirnames:
+                    all_dirs.append(Path(dirpath) / d)
+            # 按深度从深到浅排序，确保先处理深层次目录
+            all_dirs.sort(key=lambda p: len(p.parts), reverse=True)
+
+            for dir_path in all_dirs:
+                if not dir_path.exists():
+                    continue
+                # 跳过初始任务顶层目录
+                if dir_path in self.initial_top_dirs:
+                    continue
+                # 跳过根目录本身
+                if dir_path == self.target_root:
+                    continue
+
                 entries = list(dir_path.iterdir())
-            except Exception as e:
-                self.log_signal.emit(f"读取目录失败 {dir_path}: {e}")
-                return
-            if len(entries) == 1 and entries[0].is_dir():
+                if len(entries) != 1 or not entries[0].is_dir():
+                    continue
                 sub_dir = entries[0]
-                self._move_content(sub_dir, dir_path)
-                if not sub_dir.exists():
+
+                # 子目录不能是初始任务顶层目录（避免误移动）
+                if sub_dir in self.initial_top_dirs:
+                    continue
+
+                self.log_signal.emit(f"折叠包装目录: {sub_dir.name} -> {dir_path.name}")
+                self._move_all_contents(sub_dir, dir_path)
+
+                # 仅当子目录已空时才删除；否则保留
+                if not any(sub_dir.iterdir()):
+                    try:
+                        sub_dir.rmdir()
+                    except OSError as e:
+                        self.log_signal.emit(f"删除空目录失败 {sub_dir}: {e}")
+                        continue
                     changed = True
                 else:
-                    break
+                    self.log_signal.emit(f"包装目录折叠后仍有内容，保留: {sub_dir}")
 
-    def _smart_flatten_outer(self, dest_dir: Path):
-        try:
-            entries = list(dest_dir.iterdir())
-        except Exception as e:
-            self.log_signal.emit(f"读取目录失败 {dest_dir}: {e}")
-            return dest_dir
-
-        if len(entries) == 1 and entries[0].is_dir():
-            sub_dir = entries[0]
-            parent = dest_dir.parent
-            target = parent / sub_dir.name
-
-            self.log_signal.emit(f"智能提升：{sub_dir.name} -> {target}")
-
-            try:
-                if not target.exists():
-                    shutil.move(str(sub_dir), str(target))
-                    self.log_signal.emit(f"已移动文件夹: {sub_dir.name}")
-                else:
-                    self._move_content(sub_dir, target)
-
-                if not any(dest_dir.iterdir()):
-                    dest_dir.rmdir()
-                    self.log_signal.emit(f"已删除空目录: {dest_dir}")
-                else:
-                    self.log_signal.emit(f"dest_dir 未清空，保留: {dest_dir}")
-
-                self._smart_flatten_inner(target)
-                return target
-            except Exception as e:
-                self.log_signal.emit(f"智能提升失败: {e}")
-                return dest_dir
-        else:
-            self._smart_flatten_inner(dest_dir)
-            return dest_dir
-
-    def _promote_if_single_child(self, dir_path: Path, stop_dir: Path = None):
-        if not dir_path.exists():
-            return None
-        if stop_dir is not None and dir_path.resolve() == stop_dir.resolve():
-            return None
-        try:
-            entries = list(dir_path.iterdir())
-        except Exception as e:
-            self.log_signal.emit(f"读取目录失败 {dir_path}: {e}")
-            return None
-        if len(entries) == 1 and entries[0].is_dir():
-            sub_dir = entries[0]
-            parent = dir_path.parent
-            target = parent / sub_dir.name
-            self.log_signal.emit(f"目录折叠：{dir_path.name} -> {target}")
-            try:
-                if not target.exists():
-                    shutil.move(str(sub_dir), str(target))
-                else:
-                    self._move_content(sub_dir, target)
-                if not any(dir_path.iterdir()):
-                    dir_path.rmdir()
-                    self.log_signal.emit(f"已删除空目录: {dir_path}")
-                    return parent
-                else:
-                    self.log_signal.emit(f"目录未清空: {dir_path}")
-                    return None
-            except Exception as e:
-                self.log_signal.emit(f"提升失败: {e}")
-                return None
-        return None
-
-    def _global_flatten_single_child_dirs(self, root: Path):
+    # ---------- 同名嵌套合并 ----------
+    def _flatten_same_name_nested(self, root: Path):
+        """
+        自底向上合并所有“仅含一个子目录且子目录与父目录同名”的目录。
+        此步骤在包装目录折叠之后执行，专门处理初始顶层目录下的同名冗余。
+        """
         if not root.exists():
             return
-        try:
-            for child in list(root.iterdir()):
-                if child.is_symlink():
-                    continue
-                if child.is_dir():
-                    self._global_flatten_single_child_dirs(child)
-            for child in list(root.iterdir()):
-                if child.is_dir() and not child.is_symlink():
-                    self._promote_if_single_child(child, stop_dir=root)
-        except Exception as e:
-            self.log_signal.emit(f"全局去嵌套失败: {e}")
 
-    def _should_continue_recursion(self, dir_path: Path) -> bool:
-        if not dir_path.exists():
-            return False
-        entries = list(dir_path.iterdir())
+        for child in list(root.iterdir()):
+            if child.is_dir() and not child.is_symlink():
+                self._flatten_same_name_nested(child)
+
+        changed = True
+        while changed:
+            changed = False
+            entries = list(root.iterdir())
+            if len(entries) != 1 or not entries[0].is_dir():
+                break
+            sub_dir = entries[0]
+            if sub_dir.name.lower() != root.name.lower():
+                break
+
+            self.log_signal.emit(f"同名嵌套合并: {sub_dir.name} -> {root.name}")
+            self._move_all_contents(sub_dir, root)
+            if not any(sub_dir.iterdir()):
+                sub_dir.rmdir()
+                changed = True
+            else:
+                self.log_signal.emit(f"同名合并后源目录仍有内容，停止: {sub_dir}")
+                break
+
+    # ---------- 解压阶段 ----------
+    def _flatten_and_recurse(self, current_dir: Path, depth: int):
+        """仅负责解压和递归发现新压缩包，不移动任何文件夹"""
+        if depth > self.max_depth:
+            return
+        try:
+            entries = list(current_dir.iterdir())
+        except FileNotFoundError:
+            return
         if not entries:
-            return False
-        if len(entries) == 1 and entries[0].is_file():
-            return True
-        for entry in entries:
-            if entry.is_dir():
-                return False
-            if not (is_archive(entry) or detect_archive_type_by_magic(entry)):
-                return False
-        return True
+            return
 
-    def _scan_archives_with_magic(self, folder_path: Path, base_for_rel: Path):
-        jobs = []
-        try:
-            entries = list(folder_path.iterdir())
-        except Exception:
-            return jobs
-        base_resolved = Path(base_for_rel).resolve()
+        # 情况1：只有一个文件且是压缩包（或分卷组主文件）
         if len(entries) == 1 and entries[0].is_file():
             fp = entries[0]
-            rel_parent = fp.parent.relative_to(base_resolved)
-            job = ExtractJob(fp, rel_parent, is_intermediate=True)
-            job.is_disguised = True
-            jobs.append(job)
-            self.force_try_files.add(fp.resolve())
-            return jobs
-        for entry in entries:
-            if entry.is_file():
-                fp = entry
-                if is_archive(fp) and not is_split_volume(fp):
-                    rel_parent = entry.parent.relative_to(base_resolved)
-                    jobs.append(ExtractJob(fp, rel_parent, is_intermediate=True))
+            if fp.name.lower().endswith('.zip'):
+                vols = find_zip_volume_files(fp)
+                is_split = len(vols) > 1
+            else:
+                vols = [fp]
+                is_split = False
+
+            if is_archive(fp) or detect_archive_type_by_magic(fp) or is_split:
+                self.log_signal.emit(f"正在解压: {fp.name} -> {current_dir}")
+                try:
+                    if is_split:
+                        extract_with_7z(fp, current_dir, password=None)
+                    else:
+                        extract_archive_advanced(fp, current_dir, passwords=self.passwords)
+                except Exception as e:
+                    self.log_signal.emit(f"解压失败 {fp.name}: {e}")
+                    self.failed_archives[fp.resolve()] = str(e)
+                    return
+                if self.delete_intermediate:
+                    self._delete_file_or_split(ArchiveTask(fp, Path('.'), vols))
+                self._flatten_and_recurse(current_dir, depth + 1)
+                return
+
+        # 情况2：多个条目
+        for entry in list(current_dir.iterdir()):
+            if entry.is_dir():
+                self._flatten_and_recurse(entry, depth + 1)
+            elif entry.is_file():
+                if is_zip_split_volume(entry):
                     continue
-                magic_type = detect_archive_type_by_magic(fp)
-                if magic_type and not is_split_volume(fp):
-                    rel_parent = entry.parent.relative_to(base_resolved)
-                    job = ExtractJob(fp, rel_parent, is_intermediate=True)
-                    job.magic_type = magic_type
-                    job.is_disguised = True
-                    jobs.append(job)
-        return jobs
+                if is_archive(entry) or detect_archive_type_by_magic(entry):
+                    sub_dest = unique_dir(current_dir / entry.stem)
+                    vols = find_zip_volume_files(entry) if entry.name.lower().endswith('.zip') else [entry]
+                    tmp_task = ArchiveTask(entry, Path('.'), vols)
+                    self._process_task(tmp_task, sub_dest, depth + 1)
 
-    def _prepare_split_archive(self, archive_path: Path, magic_type: str):
-        parent = archive_path.parent
-        stem = archive_path.name
-        m = re.match(r'(.+\.part)(\d+)\..+$', stem, re.IGNORECASE)
-        if not m:
-            return archive_path, None
-        base = m.group(1)
-        index = m.group(2)
-        pattern = re.compile(re.escape(base) + r'(\d+)\..+', re.IGNORECASE)
-        related_files = []
-        for f in parent.iterdir():
-            if f.is_file():
-                fm = pattern.match(f.name)
-                if fm:
-                    mt = detect_archive_type_by_magic(f)
-                    if mt:
-                        related_files.append((f, fm.group(1), mt))
-        if not related_files:
-            return archive_path, None
+    def _delete_file_or_split(self, task: ArchiveTask):
+        if task.is_split:
+            for vol in task.volumes:
+                if vol.exists():
+                    try:
+                        safe_delete(vol, use_trash=self.use_trash)
+                        self.log_signal.emit(f"已删除分卷文件: {vol.name}")
+                    except Exception as e:
+                        self.log_signal.emit(f"删除分卷文件失败 {vol.name}: {e}")
+        else:
+            if task.main_file.exists():
+                try:
+                    safe_delete(task.main_file, use_trash=self.use_trash)
+                    self.log_signal.emit(f"已删除中间文件: {task.main_file.name}")
+                except Exception as e:
+                    self.log_signal.emit(f"删除中间文件失败 {task.main_file.name}: {e}")
 
-        first_magic = related_files[0][2]
-        ext_map = {
-            'zip': '.zip',
-            'rar': '.rar',
-            '7z': '.7z',
-            'gzip': '.gz',
-            'bzip2': '.bz2',
-            'xz': '.xz',
-            'tar': '.tar'
-        }
-        ext = ext_map.get(first_magic, '.zip')
-
-        main_part_path = None
-        for file, idx, mt in related_files:
-            new_name = f"{base}{idx}{ext}"
-            new_path = file.parent / new_name
-            if new_path.exists() and new_path != file:
-                self.log_signal.emit(f"目标文件名已存在，跳过重命名: {new_name}")
-                continue
-            try:
-                file.rename(new_path)
-                self.log_signal.emit(f"已重命名: {file.name} -> {new_name}")
-            except Exception as e:
-                self.log_signal.emit(f"重命名失败 {file.name}: {e}")
-                continue
-            if idx == '1':
-                main_part_path = new_path
-        if main_part_path is None and related_files:
-            first_file, first_idx, _ = related_files[0]
-            new_name = f"{base}{first_idx}{ext}"
-            candidate = first_file.parent / new_name
-            if candidate.exists():
-                main_part_path = candidate
-        return main_part_path, None
-
-    def _process_archive(self, archive_path: Path, dest_dir: Path, depth: int):
+    def _process_task(self, task: ArchiveTask, dest_dir: Path, depth: int):
         if self._is_cancelled or depth > self.max_depth:
             return
-        abs_path = archive_path.resolve()
-        if abs_path in self.seen_archives:
+        key = task.main_file.resolve()
+        if key in self.seen_archives:
             return
-        self.seen_archives.add(abs_path)
+        self.seen_archives.add(key)
 
         try:
-            actual_archive_path = archive_path
-            magic_type = detect_archive_type_by_magic(archive_path)
-            force_try = abs_path in self.force_try_files
-
-            if not is_archive(archive_path) and (magic_type or force_try):
-                if '.part' in archive_path.name.lower():
-                    actual_archive_path, _ = self._prepare_split_archive(archive_path, magic_type)
-                    if actual_archive_path is None:
-                        self.log_signal.emit(f"无法处理分包文件: {archive_path.name}")
-                        self.failed_archives.add(abs_path)
-                        return
-            self.log_signal.emit(f"正在解压: {archive_path.name} -> {dest_dir}")
-            extract_archive_advanced(actual_archive_path, dest_dir, passwords=self.passwords)
+            self.log_signal.emit(f"正在解压: {task.main_file.name} -> {dest_dir}")
+            if task.is_split:
+                extract_with_7z(task.main_file, dest_dir, password=None)
+            else:
+                extract_archive_advanced(task.main_file, dest_dir, passwords=self.passwords)
 
             if not dest_dir.exists() or not any(dest_dir.iterdir()):
-                self.log_signal.emit(f"解压结果为空目录: {archive_path.name}")
+                self.log_signal.emit(f"解压结果为空目录: {task.main_file.name}")
                 try:
                     if dest_dir.exists():
                         dest_dir.rmdir()
                 except OSError:
                     pass
-                self.failed_archives.add(abs_path)
+                self.failed_archives[key] = "解压结果为空目录"
                 return
 
-            actual_content_dir = dest_dir
-            if self.smart_flatten:
-                actual_content_dir = self._smart_flatten_outer(dest_dir)
-
-            continue_recursion = self._should_continue_recursion(actual_content_dir)
-
-            if self.recursive and continue_recursion:
-                new_jobs = self._scan_archives_with_magic(actual_content_dir, actual_content_dir)
-                for job in new_jobs:
-                    if job.archive_path.resolve() in self.seen_archives:
-                        continue
-                    job.is_intermediate = True
-                    rel_parent = job.archive_path.parent.relative_to(actual_content_dir)
-                    new_dest = unique_dir(actual_content_dir / rel_parent / job.archive_path.stem)
-                    self._process_archive(job.archive_path, new_dest, depth + 1)
-
             if self.delete_intermediate and depth > 0:
-                try:
-                    if archive_path.exists():
-                        archive_path.unlink()
-                        self.log_signal.emit(f"已删除中间文件: {archive_path.name}")
-                except Exception as e:
-                    self.log_signal.emit(f"删除中间文件失败 {archive_path.name}: {e}")
+                self._delete_file_or_split(task)
 
-                parent_dir = archive_path.parent
-                target_root = Path(self.target_root).resolve()
-                current = parent_dir
-                while True:
-                    new_parent = self._promote_if_single_child(current, stop_dir=target_root)
-                    if new_parent is None:
-                        break
-                    current = new_parent
+            self._flatten_and_recurse(dest_dir, depth)
 
         except Exception as e:
-            self.log_signal.emit(f"处理过程中发生异常: {e}")
-            self.failed_archives.add(abs_path)
+            self.log_signal.emit(f"处理异常: {e}")
+            self.failed_archives[key] = str(e)
 
     def run(self):
+        total = len(self.jobs)
+        self.initial_top_dirs.clear()
         try:
-            total_initial = len(self.jobs)
-            processed_count = 0
-            for job, row in self.jobs:
+            self.log_signal.emit(f"开始解压任务，共 {total} 个")
+            for index, (task, row) in enumerate(self.jobs, 1):
                 if self._is_cancelled:
                     self.log_signal.emit("任务已取消")
-                    if row >= 0:
-                        self.status_signal.emit(row, "已取消")
+                    for remaining_task, remaining_row in self.jobs[index-1:]:
+                        self.status_signal.emit(remaining_row, "已取消")
                     break
-                rel_parent = job.relative_parent
-                dest_base = Path(self.target_root) / rel_parent / job.archive_path.stem
-                dest = unique_dir(dest_base)
-                self.log_signal.emit(f"处理初始任务: {job.archive_path.name}")
-                if row >= 0:
-                    self.status_signal.emit(row, "解压中")
-                self._process_archive(job.archive_path, dest, depth=0)
 
-                if row >= 0:
-                    abs_path = job.archive_path.resolve()
-                    if abs_path in self.failed_archives:
-                        self.status_signal.emit(row, "失败")
-                    else:
-                        self.status_signal.emit(row, "成功")
-                processed_count += 1
-                self.progress_signal.emit(int(processed_count / total_initial * 100))
-                self.log_signal.emit(f"已完成 {processed_count}/{total_initial} 个初始任务")
+                dest = unique_dir(self.target_root / task.relative_parent / task.main_file.stem)
+                self.initial_top_dirs.add(dest)
+                self.log_signal.emit(f"处理初始任务: {task.main_file.name}")
 
-            if self.global_flatten:
-                self.log_signal.emit("正在全局优化目录结构（去除冗余嵌套）...")
-                self._global_flatten_single_child_dirs(Path(self.target_root))
+                self._process_task(task, dest, depth=0)
+
+                if task.main_file.resolve() in self.failed_archives:
+                    self.status_signal.emit(row, "失败")
+                else:
+                    self.status_signal.emit(row, "成功")
+
+                self.progress_signal.emit(int(index / total * 100))
+                self.log_signal.emit(f"已完成 {index}/{total} 个初始任务")
+
+            # ===== 所有解压完成后，开始目录整理 =====
+            if not self._is_cancelled:
+                # 第一步：折叠包装目录（排除初始任务顶层目录）
+                self.log_signal.emit("开始折叠包装目录...")
+                self._fold_wrapper_dirs(self.target_root)
+
+                # 第二步：同名嵌套合并
+                self.log_signal.emit("开始同名嵌套合并...")
+                self._flatten_same_name_nested(self.target_root)
+
+            success_count = sum(1 for task, _ in self.jobs
+                                if task.main_file.resolve() not in self.failed_archives)
+            self.summary_signal.emit({
+                'total': total,
+                'success': success_count,
+                'failed': len(self.failed_archives),
+                'details': {str(k): v for k, v in self.failed_archives.items()}
+            })
         except Exception as e:
-            self.log_signal.emit(f"工作线程异常终止: {e}")
+            self.log_signal.emit(f"工作线程发生严重异常: {e}")
+            for task, row in self.jobs:
+                if task.main_file.resolve() not in self.failed_archives:
+                    self.status_signal.emit(row, "失败")
+            self.summary_signal.emit({
+                'total': total,
+                'success': 0,
+                'failed': total,
+                'details': {'worker_error': str(e)}
+            })
         finally:
             self.progress_signal.emit(100)
             self.finished_signal.emit()
-
 # ---------- 主窗口 ----------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("批量解压工具 v15.0 - 深色主题")
-        self.setMinimumSize(1100, 800)
-        self.jobs = []
-        self.row_to_job = {}
+        self.setWindowTitle("批量解压工具 v26.0 - 深色主题")
+        self.setMinimumSize(1200, 850)
+        self.tasks = []             # list of ArchiveTask
+        self.row_to_task = {}       # 表格行号 -> ArchiveTask
         self.worker = None
         self.setAcceptDrops(True)
 
@@ -789,42 +837,51 @@ class MainWindow(QMainWindow):
         target_layout = QHBoxLayout()
         target_layout.addWidget(QLabel("目标文件夹:"))
         self.target_edit = QLineEdit(self.config.get('target_dir', str(Path.home() / "Downloads")))
-        self.target_edit.setPlaceholderText("选择或输入输出目录")
         target_layout.addWidget(self.target_edit)
         browse_btn = QPushButton("浏览...")
-        browse_btn.setIcon(self.get_icon("browse.png", QStyle.StandardPixmap.SP_DirOpenIcon))
         browse_btn.clicked.connect(self.browse_target)
         target_layout.addWidget(browse_btn)
         open_btn = QPushButton("打开")
-        open_btn.setObjectName("secondary")
-        open_btn.setIcon(self.get_icon("open.png", QStyle.StandardPixmap.SP_DialogOpenButton))
         open_btn.clicked.connect(self.open_target)
         target_layout.addWidget(open_btn)
         layout.addLayout(target_layout)
 
-        # 添加按钮、密码管理、目录策略
+        # 添加按钮、密码管理、目录策略、递归模式、冲突策略
         add_layout = QHBoxLayout()
-        add_file_btn = QPushButton("添加文件")
-        add_file_btn.setIcon(self.get_icon("add_file.png", QStyle.StandardPixmap.SP_FileIcon))
-        add_file_btn.clicked.connect(self.add_files_dialog)
-        add_folder_btn = QPushButton("添加文件夹")
-        add_folder_btn.setIcon(self.get_icon("add_folder.png", QStyle.StandardPixmap.SP_DirIcon))
-        add_folder_btn.clicked.connect(self.add_folder_dialog)
+        self.add_file_btn = QPushButton("添加文件")
+        self.add_file_btn.clicked.connect(self.add_files_dialog)
+        self.add_folder_btn = QPushButton("添加文件夹")
+        self.add_folder_btn.clicked.connect(self.add_folder_dialog)
         self.password_btn = QPushButton("密码管理")
-        self.password_btn.setObjectName("secondary")
         self.password_btn.clicked.connect(self.manage_passwords)
-        add_layout.addWidget(add_file_btn)
-        add_layout.addWidget(add_folder_btn)
+
+        add_layout.addWidget(self.add_file_btn)
+        add_layout.addWidget(self.add_folder_btn)
         add_layout.addWidget(self.password_btn)
         add_layout.addStretch()
 
         add_layout.addWidget(QLabel("目录策略:"))
         self.strategy_combo = QComboBox()
-        self.strategy_combo.addItem("策略A：保留源文件夹结构")
-        self.strategy_combo.addItem("策略B：智能提升+全局去嵌套")
-        self.strategy_combo.addItem("策略C：保留压缩包目录，不提升")
-        self.strategy_combo.setCurrentIndex(1)   # 默认 B
+        self.strategy_combo.addItem("策略A：保留源结构")
+        self.strategy_combo.addItem("策略B：智能提升")
+        self.strategy_combo.addItem("策略C：保留压缩包目录")
+        self.strategy_combo.setCurrentIndex(1)
         add_layout.addWidget(self.strategy_combo)
+
+        add_layout.addWidget(QLabel("递归模式:"))
+        self.recursion_mode_combo = QComboBox()
+        self.recursion_mode_combo.addItem("严格（全为压缩包）")
+        self.recursion_mode_combo.addItem("宽松（存在压缩包）")
+        add_layout.addWidget(self.recursion_mode_combo)
+
+        add_layout.addWidget(QLabel("冲突处理:"))
+        self.conflict_combo = QComboBox()
+        self.conflict_combo.addItem("保留原目录")
+        self.conflict_combo.addItem("合并（丢弃同名）")
+        self.conflict_combo.addItem("合并（自动重命名）")
+        self.conflict_combo.addItem("覆盖")
+        add_layout.addWidget(self.conflict_combo)
+
         layout.addLayout(add_layout)
 
         # 选项复选框
@@ -835,12 +892,15 @@ class MainWindow(QMainWindow):
         self.smart_flatten_checkbox.setChecked(True)
         self.global_flatten_checkbox = QCheckBox("全局去除冗余嵌套")
         self.global_flatten_checkbox.setChecked(True)
-        self.delete_intermediate_checkbox = QCheckBox("删除中间层压缩包文件（不删除源文件）")
+        self.delete_intermediate_checkbox = QCheckBox("删除中间层压缩包文件")
         self.delete_intermediate_checkbox.setChecked(True)
+        self.use_trash_checkbox = QCheckBox("删除文件时移入回收站")
+        self.use_trash_checkbox.setChecked(True)
         option_layout.addWidget(self.recursive_checkbox)
         option_layout.addWidget(self.smart_flatten_checkbox)
         option_layout.addWidget(self.global_flatten_checkbox)
         option_layout.addWidget(self.delete_intermediate_checkbox)
+        option_layout.addWidget(self.use_trash_checkbox)
         option_layout.addStretch()
         layout.addLayout(option_layout)
 
@@ -868,23 +928,16 @@ class MainWindow(QMainWindow):
         self.log_text.setMaximumHeight(150)
         layout.addWidget(self.log_text)
 
-        # 按钮布局
+        # 底部按钮
         btn_layout = QHBoxLayout()
         self.start_btn = QPushButton("开始解压")
-        self.start_btn.setIcon(self.get_icon("start.png", QStyle.StandardPixmap.SP_MediaPlay))
         self.start_btn.clicked.connect(self.start_extract)
         self.cancel_btn = QPushButton("取消")
-        self.cancel_btn.setObjectName("danger")
-        self.cancel_btn.setIcon(self.get_icon("cancel.png", QStyle.StandardPixmap.SP_MediaStop))
-        self.cancel_btn.clicked.connect(self.cancel_extract)
         self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_extract)
         self.clear_btn = QPushButton("清空列表")
-        self.clear_btn.setObjectName("secondary")
-        self.clear_btn.setIcon(self.get_icon("clear.png", QStyle.StandardPixmap.SP_TrashIcon))
         self.clear_btn.clicked.connect(self.clear_queue)
         self.remove_done_btn = QPushButton("移除已完成")
-        self.remove_done_btn.setObjectName("secondary")
-        self.remove_done_btn.setIcon(self.get_icon("remove_done.png", QStyle.StandardPixmap.SP_DialogResetButton))
         self.remove_done_btn.clicked.connect(self.remove_finished)
         btn_layout.addWidget(self.start_btn)
         btn_layout.addWidget(self.cancel_btn)
@@ -894,20 +947,20 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # 连接策略变化信号
+        # 策略变化联动
         self.strategy_combo.currentIndexChanged.connect(self.on_strategy_changed)
         self.on_strategy_changed(self.strategy_combo.currentIndex())
 
     def on_strategy_changed(self, index):
-        if index == 0:   # 策略A
+        if index == 0:   # A
             self.smart_flatten_checkbox.setEnabled(False)
             self.global_flatten_checkbox.setEnabled(False)
             self.smart_flatten_checkbox.setChecked(False)
             self.global_flatten_checkbox.setChecked(False)
-        elif index == 1: # 策略B
+        elif index == 1: # B
             self.smart_flatten_checkbox.setEnabled(True)
             self.global_flatten_checkbox.setEnabled(True)
-        elif index == 2: # 策略C
+        elif index == 2: # C
             self.smart_flatten_checkbox.setEnabled(False)
             self.global_flatten_checkbox.setEnabled(False)
             self.smart_flatten_checkbox.setChecked(False)
@@ -921,29 +974,22 @@ class MainWindow(QMainWindow):
     def load_config(self):
         try:
             with open(self.config_path(), 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                if isinstance(config, dict):
-                    return config
+                return json.load(f)
         except Exception:
-            pass
-        return {}
+            return {}
 
     def save_config(self):
         config = {
             'target_dir': self.target_edit.text().strip(),
             'last_add_file_dir': self.config.get('last_add_file_dir', ''),
             'last_add_folder_dir': self.config.get('last_add_folder_dir', ''),
-            'strategy': self.strategy_combo.currentIndex()
+            'strategy': self.strategy_combo.currentIndex(),
+            'recursion_mode': self.recursion_mode_combo.currentIndex(),
+            'conflict_policy': self.conflict_combo.currentIndex(),
+            'use_trash': self.use_trash_checkbox.isChecked()
         }
-        try:
-            with open(self.config_path(), 'w', encoding='utf-8') as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            self.log(f"保存配置失败: {e}")
-
-    def update_config_from_state(self):
-        """在关键操作后更新配置并保存"""
-        self.save_config()
+        with open(self.config_path(), 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
 
     def closeEvent(self, event):
         self.save_config()
@@ -960,8 +1006,8 @@ class MainWindow(QMainWindow):
             if file_path.exists():
                 with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    if isinstance(data, list):
-                        return data
+                    if isinstance(data, list) and data:
+                        return [decrypt_text(item) for item in data]
         except Exception:
             pass
         return []
@@ -970,17 +1016,18 @@ class MainWindow(QMainWindow):
         try:
             app_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
             file_path = app_dir / "passwords.json"
+            encrypted = [encrypt_text(pwd) for pwd in self.passwords]
             with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.passwords, f, ensure_ascii=False, indent=2)
+                json.dump(encrypted, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            self.log(f"保存密码列表失败: {e}")
+            self.log(f"保存密码失败: {e}")
 
     def manage_passwords(self):
         dialog = PasswordManagerDialog(self.passwords, self)
         if dialog.exec() == QDialog.Accepted:
             self.passwords = dialog.get_passwords()
             self.save_passwords()
-            self.log(f"密码列表已更新（当前 {len(self.passwords)} 条）")
+            self.log(f"密码列表已更新（当前 {len(self.passwords)} 条，加密存储）")
 
     # ---------- 深色主题 ----------
     def apply_dark_theme(self):
@@ -1052,7 +1099,7 @@ class MainWindow(QMainWindow):
             }
         """)
 
-    def get_icon(self, filename: str, fallback_pixmap):
+    def get_icon(self, filename, fallback_pixmap):
         try:
             app_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
             icon_path = app_dir / "icons" / filename
@@ -1079,7 +1126,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "目标文件夹不存在")
 
     def add_files_dialog(self):
-        # 确定初始目录：优先 last_add_file_dir，否则目标文件夹
         start_dir = self.config.get('last_add_file_dir', '')
         if not start_dir or not Path(start_dir).exists():
             start_dir = self.target_edit.text().strip()
@@ -1091,9 +1137,7 @@ class MainWindow(QMainWindow):
             "压缩包 (*.zip *.7z *.rar *.tar *.tar.gz *.tgz *.bz2 *.xz *.001 *.part1.rar);;所有文件 (*)"
         )
         if files:
-            # 保存最后选择文件的父目录
-            last_file = Path(files[-1])
-            self.config['last_add_file_dir'] = str(last_file.parent)
+            self.config['last_add_file_dir'] = str(Path(files[-1]).parent)
             self.save_config()
         for f in files:
             self.add_single_file(Path(f))
@@ -1110,7 +1154,7 @@ class MainWindow(QMainWindow):
         dialog.setOption(QFileDialog.ShowDirsOnly, True)
         dialog.setOption(QFileDialog.DontUseNativeDialog, True)
         dialog.setWindowTitle("选择文件夹（支持 Ctrl/Shift 多选）")
-        dialog.setDirectory(start_dir)   # 设置初始目录
+        dialog.setDirectory(start_dir)
         for view in dialog.findChildren(QListView):
             view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         for view in dialog.findChildren(QTreeView):
@@ -1118,61 +1162,59 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             folders = dialog.selectedFiles()
             if folders:
-                # 保存最后一个所选文件夹的父目录
-                last_folder = Path(folders[-1])
-                self.config['last_add_folder_dir'] = str(last_folder.parent)
+                self.config['last_add_folder_dir'] = str(Path(folders[-1]).parent)
                 self.save_config()
             for f in folders:
                 if Path(f).is_dir():
                     self.add_folder(Path(f))
 
     def add_single_file(self, file_path: Path):
+        if is_zip_split_volume(file_path):
+            self.log(f"跳过旧式 ZIP 分卷后续卷: {file_path.name}（请选择主文件 .zip）")
+            return
         if not is_archive(file_path):
             magic_type = detect_archive_type_by_magic(file_path)
             if magic_type:
-                self.log(f"检测到伪装压缩包: {file_path.name} (实际为 {magic_type})")
+                self.log(f"检测到伪装压缩包: {file_path.name}")
             else:
                 self.log(f"跳过非压缩包文件: {file_path.name}")
                 return
-        job = ExtractJob(file_path, Path('.'), is_intermediate=False)
-        self._add_job(job)
+        # 检测分卷组
+        if file_path.name.lower().endswith('.zip'):
+            vols = find_zip_volume_files(file_path)
+            task = ArchiveTask(file_path, Path('.'), vols)
+        else:
+            task = ArchiveTask(file_path, Path('.'))
+        self._add_task(task)
 
     def add_folder(self, folder_path: Path):
-        jobs = scan_archives_in_folder(folder_path)
-        if not jobs:
-            magic_jobs = scan_archives_with_magic(folder_path, folder_path)
-            if magic_jobs:
-                jobs = magic_jobs
-                self.log("常规扫描未发现压缩包，但通过内容检测发现以下文件:")
-                for j in jobs:
-                    self.log(f"  {j.archive_path.name}")
-            else:
-                self.log(f"文件夹中未发现压缩包: {folder_path}")
-                return
-
+        tasks = scan_archives_recursive(folder_path, folder_path)
+        if not tasks:
+            self.log(f"文件夹中未发现压缩包: {folder_path}")
+            return
         strategy_index = self.strategy_combo.currentIndex()
-        for job in jobs:
-            job.is_intermediate = False
-            if strategy_index == 0:  # 策略A：保留源文件夹结构
-                job.relative_parent = Path(folder_path.name) / job.relative_parent
-            self._add_job(job)
+        for task in tasks:
+            if strategy_index == 0:  # 策略A保留源结构
+                task.relative_parent = Path(folder_path.name) / task.relative_parent
+            self._add_task(task)
 
-    def _add_job(self, job: ExtractJob):
-        for existing in self.jobs:
-            if existing.archive_path == job.archive_path:
-                self.log(f"已存在，跳过: {job.archive_path.name}")
+    def _add_task(self, task: ArchiveTask):
+        # 去重（按主文件路径）
+        for existing in self.tasks:
+            if existing.main_file.resolve() == task.main_file.resolve():
+                self.log(f"已存在，跳过: {task.main_file.name}")
                 return
-        self.jobs.append(job)
+        self.tasks.append(task)
         row = self.table.rowCount()
         self.table.insertRow(row)
-        self.table.setItem(row, 0, QTableWidgetItem(job.archive_path.name))
-        self.table.setItem(row, 1, QTableWidgetItem(str(job.archive_path.parent)))
-        output_subdir = (job.relative_parent / job.archive_path.stem).as_posix()
+        self.table.setItem(row, 0, QTableWidgetItem(task.main_file.name))
+        self.table.setItem(row, 1, QTableWidgetItem(str(task.main_file.parent)))
+        output_subdir = (task.relative_parent / task.main_file.stem).as_posix()
         self.table.setItem(row, 2, QTableWidgetItem(output_subdir))
         self.table.setItem(row, 3, QTableWidgetItem("等待"))
         self.table.setItem(row, 4, QTableWidgetItem(""))
-        self.row_to_job[row] = job
-        self.log(f"添加: {job.archive_path.name}")
+        self.row_to_task[row] = task
+        self.log(f"添加: {task.main_file.name}")
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -1204,10 +1246,10 @@ class MainWindow(QMainWindow):
         rows = sorted(set(index.row() for index in self.table.selectedIndexes()), reverse=True)
         for row in rows:
             self.table.removeRow(row)
-            if row in self.row_to_job:
-                job = self.row_to_job.pop(row)
-                if job in self.jobs:
-                    self.jobs.remove(job)
+            if row in self.row_to_task:
+                task = self.row_to_task.pop(row)
+                if task in self.tasks:
+                    self.tasks.remove(task)
         self._rebuild_row_mapping()
         if rows:
             self.log(f"已移除 {len(rows)} 个项目")
@@ -1220,31 +1262,31 @@ class MainWindow(QMainWindow):
                 rows_to_remove.append(row)
         for row in reversed(rows_to_remove):
             self.table.removeRow(row)
-            if row in self.row_to_job:
-                job = self.row_to_job.pop(row)
-                if job in self.jobs:
-                    self.jobs.remove(job)
+            if row in self.row_to_task:
+                task = self.row_to_task.pop(row)
+                if task in self.tasks:
+                    self.tasks.remove(task)
         self._rebuild_row_mapping()
         if rows_to_remove:
             self.log(f"已移除 {len(rows_to_remove)} 个已完成项目")
 
     def _rebuild_row_mapping(self):
-        self.row_to_job.clear()
+        self.row_to_task.clear()
         for row in range(self.table.rowCount()):
             name_item = self.table.item(row, 0)
             path_item = self.table.item(row, 1)
             if name_item and path_item:
                 archive_path = Path(path_item.text()) / name_item.text()
-                for job in self.jobs:
-                    if job.archive_path == archive_path:
-                        self.row_to_job[row] = job
+                for task in self.tasks:
+                    if task.main_file == archive_path:
+                        self.row_to_task[row] = task
                         break
 
     def start_extract(self):
         if self.worker and self.worker.isRunning():
             self.log("已有解压任务在进行中")
             return
-        if not self.jobs:
+        if not self.tasks:
             QMessageBox.warning(self, "提示", "请先添加压缩包")
             return
         target = self.target_edit.text().strip()
@@ -1252,39 +1294,54 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "目标文件夹不存在，请重新选择")
             return
 
-        # 保存当前配置
         self.save_config()
-
-        extract_queue = []
-        for row, job in self.row_to_job.items():
-            if job in self.jobs:
-                extract_queue.append((job, row))
-
-        if not extract_queue:
-            QMessageBox.warning(self, "提示", "队列为空")
-            return
 
         recursive = self.recursive_checkbox.isChecked()
         smart_flatten = self.smart_flatten_checkbox.isChecked()
         global_flatten = self.global_flatten_checkbox.isChecked()
         delete_intermediate = self.delete_intermediate_checkbox.isChecked()
+        use_trash = self.use_trash_checkbox.isChecked()
         strategy_index = self.strategy_combo.currentIndex()
         strategy = 'A' if strategy_index == 0 else ('B' if strategy_index == 1 else 'C')
+        recursion_mode = 'strict' if self.recursion_mode_combo.currentIndex() == 0 else 'loose'
+        conflict_policy = ['keep', 'merge_skip', 'merge_rename', 'overwrite'][self.conflict_combo.currentIndex()]
 
-        self.worker = ExtractWorker(
-            extract_queue, target, self.passwords,
-            strategy=strategy,
-            recursive=recursive,
-            smart_flatten=smart_flatten,
-            global_flatten=global_flatten,
-            delete_intermediate=delete_intermediate
-        )
+        # 构建 (task, row) 列表，使用 self.tasks 顺序和表格行号映射
+        extract_queue = []
+        for row, task in self.row_to_task.items():
+            if task in self.tasks:
+                extract_queue.append((task, row))
+
+        if not extract_queue:
+            QMessageBox.warning(self, "提示", "队列为空（请检查任务列表）")
+            return
+
+        self.log("正在创建解压线程...")
+        try:
+            self.worker = ExtractWorker(
+                extract_queue, target, self.passwords,
+                strategy=strategy,
+                recursive=recursive,
+                smart_flatten=smart_flatten,
+                global_flatten=global_flatten,
+                delete_intermediate=delete_intermediate,
+                recursion_mode=recursion_mode,
+                conflict_policy=conflict_policy,
+                use_trash=use_trash
+            )
+        except Exception as e:
+            self.log(f"创建解压线程失败: {e}")
+            QMessageBox.critical(self, "错误", f"创建解压线程失败:\n{e}")
+            return
+
         self.worker.log_signal.connect(self.log)
         self.worker.status_signal.connect(self.update_status)
         self.worker.progress_signal.connect(self.progress.setValue)
+        self.worker.summary_signal.connect(self.show_summary)
         self.worker.finished_signal.connect(self.on_worker_finished)
         self.start_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
+        self.log("解压线程已启动")
         self.worker.start()
 
     def update_status(self, row, status):
@@ -1292,6 +1349,12 @@ class MainWindow(QMainWindow):
             item = self.table.item(row, 3)
             if item:
                 item.setText(status)
+
+    def show_summary(self, summary):
+        msg = f"解压完成\n成功: {summary['success']}\n失败: {summary['failed']}\n\n失败详情:\n"
+        for path, reason in summary['details'].items():
+            msg += f"- {Path(path).name}: {reason}\n"
+        QMessageBox.information(self, "处理结果", msg)
 
     def cancel_extract(self):
         if self.worker and self.worker.isRunning():
@@ -1309,9 +1372,9 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             QMessageBox.information(self, "提示", "请先取消当前解压任务")
             return
-        self.jobs.clear()
+        self.tasks.clear()
         self.table.setRowCount(0)
-        self.row_to_job.clear()
+        self.row_to_task.clear()
         self.progress.setValue(0)
         self.log("已清空列表")
 

@@ -1,37 +1,78 @@
-# 批量解压工具
+# 批量解压工具 (Batch Extractor)
 
-一个基于 Python + PySide6 的批量解压工具，支持递归解压、伪装文件识别、智能目录提升、密码撞库等功能。
+一款基于 PySide6 的批量解压工具，专为资源收集场景设计。支持多层嵌套压缩包、旧式 ZIP 分卷、伪装文件识别，输出干净的目标目录结构。
 
-## 功能特性
-- 拖拽添加多个压缩包/文件夹
-- 支持 ZIP、7z、RAR、TAR 等常见格式（依赖 7-Zip 等外部工具）
-- 递归解压嵌套压缩包（含伪装扩展名）
-- 智能去除冗余目录层级
-- 密码管理与自动撞库
-- 三种目录命名策略
-- 冲突处理选项（跳过/重命名/覆盖）
+## ✨ 功能特性
+
+- 批量添加文件或文件夹（支持拖拽、多选）
+- 递归解压压缩包内的压缩包，支持任意深度嵌套
+- 自动识别旧式 ZIP 分卷（`.zip` + `.z01` 等），合并解压并整体清理
+- 魔数检测识别改后缀的伪装压缩包
+- 目录整理：统一包装目录折叠 + 同名嵌套合并，消除冗余层级，同时保留初始压缩包名
+- 安全删除中间层压缩包，可移入回收站或永久删除
+- 密码管理：DPAPI 加密存储，自动尝试解压带密码的压缩包
+- 冲突处理策略：保留原目录 / 合并跳过 / 合并重命名 / 覆盖
 - 深色主题界面
 
-## 安装与运行
-1. 安装 Python 3.10+
-2. 安装依赖：
-   Bash
-   pip install -r requirements.txt
-3. 将 7z.exe 或 7za.exe 放在程序目录（可选，用于 RAR 等格式）
-4. 运行：
-   Bash
-   python extractor_app.py
+## 🚀 快速开始
 
-## 打包为 exe
-Bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --add-binary "7z.exe;." --name "BatchExtractor" extractor_app.py
+### 运行环境
 
-## 许可证
-本项目代码采用 MIT 许可证（见 LICENSE 文件）。
-7-Zip 组件采用 LGPL 许可证，详见 THIRD_PARTY_NOTICES.md。
+- Windows 10/11
+- Python 3.9+（源码运行）或直接使用打包好的 exe
 
-## 第三方组件
-本仓库可能包含 7-Zip 的命令行工具，用于解压 RAR、7z 等格式。
-7-Zip 依据 GNU LGPL v2.1 发布，版权归 Igor Pavlov 所有。
-完整许可证文本见 licenses/7zip-LGPL.txt（或 THIRD_PARTY_NOTICES.md 中的链接）。
+### 依赖安装（源码运行）
+
+```bash
+pip install -r requirements.txt
+```
+
+### 7-Zip 组件
+
+程序需要 `7z.exe` 用于解压旧式 ZIP 分卷。请将 `7z.exe` 或 `7za.exe` 放置到以下任一位置：
+
+- 程序所在目录（推荐）
+- 系统 PATH 中
+
+### 运行
+
+```bash
+python extractor_app.py
+```
+
+## 📦 打包为 EXE
+
+```bash
+pyinstaller --onefile --windowed --name BatchExtractor --add-binary "7z.exe;." extractor_app.py
+```
+
+打包完成后，将 `7z.exe` 复制到 exe 同目录即可。
+
+## ⚙️ 使用说明
+
+1. 选择目标文件夹
+2. 添加压缩包文件或文件夹
+3. 根据需要调整选项：
+   - **目录策略**：策略 B（推荐）智能整理目录结构
+   - **递归模式**：严格（目录全为压缩包才继续）或宽松（存在压缩包就继续）
+   - **冲突处理**：目录合并时的策略
+   - **删除中间层**：解压完成后删除中间压缩包，避免冗余
+   - **移入回收站**：开启后删除的文件进入回收站，可恢复
+4. 点击“开始解压”
+
+## 🗂️ 目录整理逻辑
+
+所有解压完成后执行：
+
+1. **包装目录折叠**：消除所有“只包含单个子文件夹”的无意义中间目录
+2. **同名嵌套合并**：合并父目录与子目录同名的冗余结构
+
+最终保留初始压缩包名的顶层目录，内部直接包含实际内容。
+
+## 🔒 密码存储安全
+
+密码使用 Windows DPAPI 加密后存储在 `passwords.json` 中，仅当前 Windows 用户可解密。请勿将此文件分享给他人。
+
+## 📄 许可证
+
+[MIT License](LICENSE)
