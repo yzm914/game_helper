@@ -1,13 +1,13 @@
 # 批量解压工具 (Batch Extractor)
 
-一款基于 PySide6 的批量解压工具，专为资源收集场景设计。支持多层嵌套压缩包、旧式 ZIP 分卷、伪装文件识别，输出干净的目标目录结构。
+一款基于 PySide6 的批量解压工具，专为资源收集场景设计。支持多层嵌套压缩包、RAR/旧式 ZIP 分卷、伪装文件识别，输出干净的目标目录结构。
 
 ## ✨ 功能特性
 
 - 批量添加文件或文件夹（支持拖拽、多选）
 - 递归解压压缩包内的压缩包，支持任意深度嵌套
-- 自动识别旧式 ZIP 分卷（`.zip` + `.z01` 等），合并解压并整体清理
-- 魔数检测识别改后缀的伪装压缩包
+- 分卷支持：旧式 ZIP 分卷（`.zip` + `.z01` 等）与 RAR/7z 分卷组（`.part1.rar`、`.001`），整组原子解压并整体清理
+- 魔数检测识别改后缀的伪装压缩包（如 `.jpg` 实为 zip）
 - 目录整理：统一包装目录折叠 + 同名嵌套合并，消除冗余层级，同时保留初始压缩包名
 - 安全删除中间层压缩包，可移入回收站或永久删除
 - 密码管理：DPAPI 加密存储，自动尝试解压带密码的压缩包
@@ -29,7 +29,7 @@ pip install -r requirements.txt
 
 ### 7-Zip 组件
 
-程序需要 `7z.exe` 用于解压旧式 ZIP 分卷。请将 `7z.exe` 或 `7za.exe` 放置到以下任一位置：
+程序需要 `7z.exe` 用于解压旧式 ZIP 分卷与部分 RAR。请将 `7z.exe` 或 `7za.exe` 放置到以下任一位置：
 
 - 程序所在目录（推荐）
 - 系统 PATH 中
@@ -40,13 +40,17 @@ pip install -r requirements.txt
 python extractor_app.py
 ```
 
+> 程序按脚本（或 exe）所在目录读写配置：`app_config.json` 记忆上次目标目录与选项，`passwords.json` 保存加密后的密码。
+>
+> 开发工作区中源码位于 `src/extractor_app.py`，配置随之落在 `src/` 下；本仓库使用平铺布局。
+
 ## 📦 打包为 EXE
 
 ```bash
 pyinstaller --onefile --windowed --name BatchExtractor --add-binary "7z.exe;." extractor_app.py
 ```
 
-打包完成后，将 `7z.exe` 复制到 exe 同目录即可。
+打包完成后，将 `7z.exe` 复制到 exe 同目录即可（若已用 `--add-binary` 内嵌则无需）。
 
 ## ⚙️ 使用说明
 
