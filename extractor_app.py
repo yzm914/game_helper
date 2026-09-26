@@ -1,6 +1,9 @@
 """
-批量解压工具 v24.0
-重构重点：分卷组原子处理、递归扫描完整目录树、安全的目录整理
+批量解压工具 v2.0.0
+- 重构解压引擎：解压与目录整理分离
+- 支持旧式 ZIP 分卷、RAR/7z 分卷组（.part1.rar 等）
+- 包装目录折叠 + 同名嵌套合并
+- 密码 DPAPI 加密存储
 """
 
 import sys
@@ -134,6 +137,7 @@ def is_archive(path: Path) -> bool:
     return False
 
 def is_split_volume(path: Path) -> bool:
+    """判断是否为分卷的后续卷（非主卷）"""
     name = path.name.lower()
     m = re.search(r'\.part(\d+)\.(rar|zip|7z)$', name)
     if m and int(m.group(1)) > 1:
@@ -144,6 +148,7 @@ def is_split_volume(path: Path) -> bool:
     return False
 
 def is_split_main(path: Path) -> bool:
+    """判断是否为分卷的主卷（第一个分卷）"""
     name = path.name.lower()
     m = re.search(r'\.part1\.(rar|zip|7z)$', name)
     if m:
@@ -154,6 +159,7 @@ def is_split_main(path: Path) -> bool:
     return False
 
 def is_zip_split_volume(path: Path) -> bool:
+    """判断是否为旧式 ZIP 分卷的后续卷（.z01 等）"""
     name = path.name.lower()
     return re.search(r'\.z\d{2}$', name) is not None
 
@@ -168,6 +174,39 @@ def find_zip_volume_files(main_zip_path: Path) -> list:
             if fn == stem + '.zip' or re.match(re.escape(stem) + r'\.z\d{2}$', fn):
                 volumes.append(f)
     return volumes
+
+def find_split_volume_files(main_file: Path) -> list:
+    """
+    返回与主分卷文件（如 xxx.part1.rar）同目录下的所有分卷文件。
+    支持 xxx.part1.rar、xxx.part2.rar 等命名，或 xxx.rar.001 等。
+    """
+    parent = main_file.parent
+    name = main_file.name.lower()
+    # 尝试 .partN.ext 模式
+    m = re.match(r'^(.*)\.part(\d+)\.(rar|zip|7z)$', name)
+    if m:
+        base = m.group(1)
+        ext = '.' + m.group(3)
+        pattern = re.compile(re.escape(base) + r'\.part\d+' + re.escape(ext) + r'$', re.IGNORECASE)
+        volumes = []
+        for f in parent.iterdir():
+            if f.is_file() and pattern.match(f.name):
+                volumes.append(f)
+        volumes.sort(key=lambda x: x.name.lower())
+        return volumes
+    # 尝试 .001/.002 模式
+    m2 = re.match(r'^(.*)\.(zip|7z|rar)\.(\d{3})$', name)
+    if m2:
+        base = m2.group(1)
+        ext = '.' + m2.group(2)
+        pattern = re.compile(re.escape(base) + r'\.' + re.escape(m2.group(2)) + r'\.\d{3}$', re.IGNORECASE)
+        volumes = []
+        for f in parent.iterdir():
+            if f.is_file() and pattern.match(f.name):
+                volumes.append(f)
+        volumes.sort(key=lambda x: x.name.lower())
+        return volumes
+    return [main_file]
 
 # ---------- 查找外部工具 ----------
 def find_7z():
@@ -413,7 +452,7 @@ class ArchiveTask:
 
 # ---------- 扫描函数 ----------
 def scan_archives_recursive(root: Path, base_for_rel: Path = None) -> list:
-    """递归扫描 root 下所有压缩包，返回 ArchiveTask 列表，跳过分卷后续卷"""
+    """递归扫描 root 下所有压缩包，返回 ArchiveTask 列表，跳过分卷后续卷并构建分卷组"""
     if base_for_rel is None:
         base_for_rel = root
     root_res = root.resolve()
@@ -423,23 +462,41 @@ def scan_archives_recursive(root: Path, base_for_rel: Path = None) -> list:
         dir_path = Path(dirpath)
         for f in files:
             fp = dir_path / f
-            if is_zip_split_volume(fp):   # 跳过 .z01 等后续卷
+            # 跳过旧式 ZIP 分卷后续卷
+            if is_zip_split_volume(fp):
                 continue
-            if is_archive(fp) or detect_archive_type_by_magic(fp):
-                # 确定相对父目录
-                try:
-                    rel_parent = fp.parent.relative_to(base_res)
-                except ValueError:
-                    rel_parent = Path('.')
-                # 检查是否是旧式 ZIP 分卷主文件
-                if fp.name.lower().endswith('.zip'):
-                    vols = find_zip_volume_files(fp)
-                    if len(vols) > 1:
-                        tasks.append(ArchiveTask(fp, rel_parent, vols))
-                    else:
-                        tasks.append(ArchiveTask(fp, rel_parent, [fp]))
+            # 跳过其它分卷的后续卷（如 .part2.rar）
+            if is_split_volume(fp):
+                continue
+            # 判断是否为压缩包
+            if not (is_archive(fp) or detect_archive_type_by_magic(fp)):
+                continue
+
+            try:
+                rel_parent = fp.parent.relative_to(base_res)
+            except ValueError:
+                rel_parent = Path('.')
+
+            # 处理旧式 ZIP 分卷
+            if fp.name.lower().endswith('.zip'):
+                vols = find_zip_volume_files(fp)
+                if len(vols) > 1:
+                    tasks.append(ArchiveTask(fp, rel_parent, vols))
                 else:
                     tasks.append(ArchiveTask(fp, rel_parent, [fp]))
+                continue
+
+            # 处理 RAR/7z 分卷主文件
+            if is_split_main(fp):
+                vols = find_split_volume_files(fp)
+                if len(vols) > 1:
+                    tasks.append(ArchiveTask(fp, rel_parent, vols))
+                else:
+                    tasks.append(ArchiveTask(fp, rel_parent, [fp]))
+                continue
+
+            # 普通压缩包
+            tasks.append(ArchiveTask(fp, rel_parent, [fp]))
     return tasks
 
 # ---------- 密码管理对话框 ----------
@@ -507,9 +564,9 @@ class ExtractWorker(QThread):
         self.passwords = passwords
         self.strategy = strategy
         self.recursive = recursive
-        self.smart_flatten = smart_flatten          # 不再使用
+        self.smart_flatten = smart_flatten
         self.delete_intermediate = delete_intermediate
-        self.global_flatten = global_flatten        # 不再使用
+        self.global_flatten = global_flatten
         self.max_depth = max_depth
         self.conflict_policy = conflict_policy
         self.recursion_mode = recursion_mode
@@ -517,14 +574,13 @@ class ExtractWorker(QThread):
         self._is_cancelled = False
         self.seen_archives = set()
         self.failed_archives = {}
-        self.initial_top_dirs = set()               # 记录每个初始任务的实际顶层目录
+        self.initial_top_dirs = set()
 
     def cancel(self):
         self._is_cancelled = True
 
     # ---------- 目录合并辅助 ----------
     def _move_all_contents(self, src_dir: Path, dst_dir: Path):
-        """将 src_dir 中所有条目移动到 dst_dir，按冲突策略处理"""
         for item in list(src_dir.iterdir()):
             target = dst_dir / item.name
             if not target.exists():
@@ -571,47 +627,36 @@ class ExtractWorker(QThread):
 
     # ---------- 包装目录折叠（排除初始任务顶层目录） ----------
     def _fold_wrapper_dirs(self, root: Path):
-        """
-        循环折叠所有“仅含一个子目录且无文件”的包装目录，直到无变化。
-        不折叠初始任务顶层目录和根目录本身。
-        """
         if not root.exists():
             return
 
         changed = True
         while changed:
             changed = False
-            # 收集所有目录（自底向上）
             all_dirs = []
             for dirpath, dirnames, filenames in os.walk(root):
                 for d in dirnames:
                     all_dirs.append(Path(dirpath) / d)
-            # 按深度从深到浅排序，确保先处理深层次目录
             all_dirs.sort(key=lambda p: len(p.parts), reverse=True)
 
             for dir_path in all_dirs:
                 if not dir_path.exists():
                     continue
-                # 跳过初始任务顶层目录
-                if dir_path in self.initial_top_dirs:
-                    continue
-                # 跳过根目录本身
                 if dir_path == self.target_root:
+                    continue
+                if dir_path in self.initial_top_dirs:
                     continue
 
                 entries = list(dir_path.iterdir())
                 if len(entries) != 1 or not entries[0].is_dir():
                     continue
                 sub_dir = entries[0]
-
-                # 子目录不能是初始任务顶层目录（避免误移动）
                 if sub_dir in self.initial_top_dirs:
                     continue
 
                 self.log_signal.emit(f"折叠包装目录: {sub_dir.name} -> {dir_path.name}")
                 self._move_all_contents(sub_dir, dir_path)
 
-                # 仅当子目录已空时才删除；否则保留
                 if not any(sub_dir.iterdir()):
                     try:
                         sub_dir.rmdir()
@@ -624,10 +669,6 @@ class ExtractWorker(QThread):
 
     # ---------- 同名嵌套合并 ----------
     def _flatten_same_name_nested(self, root: Path):
-        """
-        自底向上合并所有“仅含一个子目录且子目录与父目录同名”的目录。
-        此步骤在包装目录折叠之后执行，专门处理初始顶层目录下的同名冗余。
-        """
         if not root.exists():
             return
 
@@ -656,7 +697,6 @@ class ExtractWorker(QThread):
 
     # ---------- 解压阶段 ----------
     def _flatten_and_recurse(self, current_dir: Path, depth: int):
-        """仅负责解压和递归发现新压缩包，不移动任何文件夹"""
         if depth > self.max_depth:
             return
         try:
@@ -702,6 +742,9 @@ class ExtractWorker(QThread):
                 if is_archive(entry) or detect_archive_type_by_magic(entry):
                     sub_dest = unique_dir(current_dir / entry.stem)
                     vols = find_zip_volume_files(entry) if entry.name.lower().endswith('.zip') else [entry]
+                    # 如果是分卷主文件，构建完整分卷组
+                    if is_split_main(entry):
+                        vols = find_split_volume_files(entry)
                     tmp_task = ArchiveTask(entry, Path('.'), vols)
                     self._process_task(tmp_task, sub_dest, depth + 1)
 
@@ -784,11 +827,8 @@ class ExtractWorker(QThread):
 
             # ===== 所有解压完成后，开始目录整理 =====
             if not self._is_cancelled:
-                # 第一步：折叠包装目录（排除初始任务顶层目录）
                 self.log_signal.emit("开始折叠包装目录...")
                 self._fold_wrapper_dirs(self.target_root)
-
-                # 第二步：同名嵌套合并
                 self.log_signal.emit("开始同名嵌套合并...")
                 self._flatten_same_name_nested(self.target_root)
 
@@ -814,14 +854,15 @@ class ExtractWorker(QThread):
         finally:
             self.progress_signal.emit(100)
             self.finished_signal.emit()
+
 # ---------- 主窗口 ----------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("批量解压工具 v26.0 - 深色主题")
+        self.setWindowTitle("批量解压工具 v2.0.0 - 深色主题")
         self.setMinimumSize(1200, 850)
-        self.tasks = []             # list of ArchiveTask
-        self.row_to_task = {}       # 表格行号 -> ArchiveTask
+        self.tasks = []
+        self.row_to_task = {}
         self.worker = None
         self.setAcceptDrops(True)
 
@@ -1172,6 +1213,9 @@ class MainWindow(QMainWindow):
         if is_zip_split_volume(file_path):
             self.log(f"跳过旧式 ZIP 分卷后续卷: {file_path.name}（请选择主文件 .zip）")
             return
+        if is_split_volume(file_path):
+            self.log(f"跳过分卷后续卷: {file_path.name}（请选择第一个分卷，如 .part1.rar）")
+            return
         if not is_archive(file_path):
             magic_type = detect_archive_type_by_magic(file_path)
             if magic_type:
@@ -1179,12 +1223,17 @@ class MainWindow(QMainWindow):
             else:
                 self.log(f"跳过非压缩包文件: {file_path.name}")
                 return
+
         # 检测分卷组
+        vols = []
         if file_path.name.lower().endswith('.zip'):
             vols = find_zip_volume_files(file_path)
-            task = ArchiveTask(file_path, Path('.'), vols)
-        else:
-            task = ArchiveTask(file_path, Path('.'))
+        elif is_split_main(file_path):
+            vols = find_split_volume_files(file_path)
+        if not vols:
+            vols = [file_path]
+
+        task = ArchiveTask(file_path, Path('.'), vols)
         self._add_task(task)
 
     def add_folder(self, folder_path: Path):
@@ -1199,7 +1248,6 @@ class MainWindow(QMainWindow):
             self._add_task(task)
 
     def _add_task(self, task: ArchiveTask):
-        # 去重（按主文件路径）
         for existing in self.tasks:
             if existing.main_file.resolve() == task.main_file.resolve():
                 self.log(f"已存在，跳过: {task.main_file.name}")
@@ -1306,14 +1354,13 @@ class MainWindow(QMainWindow):
         recursion_mode = 'strict' if self.recursion_mode_combo.currentIndex() == 0 else 'loose'
         conflict_policy = ['keep', 'merge_skip', 'merge_rename', 'overwrite'][self.conflict_combo.currentIndex()]
 
-        # 构建 (task, row) 列表，使用 self.tasks 顺序和表格行号映射
         extract_queue = []
         for row, task in self.row_to_task.items():
             if task in self.tasks:
                 extract_queue.append((task, row))
 
         if not extract_queue:
-            QMessageBox.warning(self, "提示", "队列为空（请检查任务列表）")
+            QMessageBox.warning(self, "提示", "队列为空")
             return
 
         self.log("正在创建解压线程...")
