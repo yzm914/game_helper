@@ -29,10 +29,14 @@ pip install -r requirements.txt
 
 ### 7-Zip 组件
 
-程序需要 `7z.exe` 用于解压旧式 ZIP 分卷与部分 RAR。请将 `7z.exe` 或 `7za.exe` 放置到以下任一位置：
+程序需要 `7z.exe` 用于解压分卷（`.zip`+`.z01`、`.partN.rar`、`.7z.001`）与 RAR。请将 **`7z.exe` 与 `7z.dll` 一起**放到以下任一位置：
 
 - 程序所在目录（推荐）
 - 系统 PATH 中
+
+> ⚠️ `7z.exe` 取自 7-Zip 安装包时**不是独立程序**，运行时必须能加载同目录的 `7z.dll`，否则会报 `Codec Load Error: 7z.dll : 找不到指定的模块`，所有分卷/RAR 任务都会失败。若想只用单个文件，请改用独立版 `7za.exe`（改为它，并把下面的 `7z.exe` 换成 `7za.exe`）。
+>
+> 预编译的 exe 已内嵌这两个文件，无需额外放置。
 
 ### 运行
 
@@ -42,15 +46,15 @@ python extractor_app.py
 
 > 程序按脚本（或 exe）所在目录读写配置：`app_config.json` 记忆上次目标目录与选项，`passwords.json` 保存加密后的密码。
 >
-> 开发工作区中源码位于 `src/extractor_app.py`，配置随之落在 `src/` 下；本仓库使用平铺布局。
+> 开发工作区中源码位于 `src/extractor_app.py`、解压器位于 `tools\`，配置随之落在 `src/` 下；本仓库使用平铺布局。开发工作区请用 `scripts\run-dev.cmd` 启动（它会把 `tools\` 加进 PATH，否则找不到 `7z.exe`）。
 
 ## 📦 打包为 EXE
 
 ```bash
-pyinstaller --onefile --windowed --name BatchExtractor --add-binary "7z.exe;." extractor_app.py
+pyinstaller --onefile --windowed --name BatchExtractor --add-binary "7z.exe;." --add-binary "7z.dll;." extractor_app.py
 ```
 
-打包完成后，将 `7z.exe` 复制到 exe 同目录即可（若已用 `--add-binary` 内嵌则无需）。
+打包完成后，将 `7z.exe` 与 `7z.dll` 复制到 exe 同目录即可（若已用 `--add-binary` 内嵌则无需）。
 
 ## ⚙️ 使用说明
 

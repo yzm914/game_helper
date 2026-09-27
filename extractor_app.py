@@ -163,6 +163,37 @@ def is_zip_split_volume(path: Path) -> bool:
     name = path.name.lower()
     return re.search(r'\.z\d{2}$', name) is not None
 
+def archive_base_name(path: Path) -> str:
+    """
+    输出目录名归一化：剥掉分卷（与复合扩展名）标记，返回压缩包的“基名”。
+
+    历史缺陷：目标子目录曾直接用 Path.stem，而 stem 只去掉最后一段扩展名，
+    于是分卷输入会把分卷标记留在目录名里——
+        19284.part1.rar  ->  19284.part1    （应为 19284）
+        PC10009.7z.001   ->  PC10009.7z     （应为 PC10009）
+    旧版靠“目录折叠”顺手折掉残尾（设计史 L19411），v1.1.0 起折叠只处理
+    “仅含单个子目录”的目录，残尾便留了下来。这里统一在命名处归一，
+    不再依赖任何会改名/移动目录的折叠逻辑。
+    """
+    name = path.name
+    # xxx.partN.rar / .zip / .7z
+    m = re.match(r'^(.*)\.part\d+\.(rar|zip|7z)$', name, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # xxx.rar.001 / xxx.zip.002 / xxx.7z.001
+    m = re.match(r'^(.*)\.(rar|zip|7z)\.\d{3}$', name, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # 旧式 ZIP 分卷后续卷 xxx.z01（通常不作为任务，兜底同样归一）
+    m = re.match(r'^(.*)\.z\d{2}$', name, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # xxx.tar.gz / xxx.tar.bz2 / xxx.tar.xz
+    m = re.match(r'^(.*)\.tar\.(gz|bz2|xz)$', name, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return path.stem
+
 def find_zip_volume_files(main_zip_path: Path) -> list:
     """返回与主 zip 文件相关的所有分卷文件（不区分大小写）"""
     parent = main_zip_path.parent
@@ -740,7 +771,7 @@ class ExtractWorker(QThread):
                 if is_zip_split_volume(entry):
                     continue
                 if is_archive(entry) or detect_archive_type_by_magic(entry):
-                    sub_dest = unique_dir(current_dir / entry.stem)
+                    sub_dest = unique_dir(current_dir / archive_base_name(entry))
                     vols = find_zip_volume_files(entry) if entry.name.lower().endswith('.zip') else [entry]
                     # 如果是分卷主文件，构建完整分卷组
                     if is_split_main(entry):
@@ -811,7 +842,7 @@ class ExtractWorker(QThread):
                         self.status_signal.emit(remaining_row, "已取消")
                     break
 
-                dest = unique_dir(self.target_root / task.relative_parent / task.main_file.stem)
+                dest = unique_dir(self.target_root / task.relative_parent / archive_base_name(task.main_file))
                 self.initial_top_dirs.add(dest)
                 self.log_signal.emit(f"处理初始任务: {task.main_file.name}")
 
@@ -1257,7 +1288,7 @@ class MainWindow(QMainWindow):
         self.table.insertRow(row)
         self.table.setItem(row, 0, QTableWidgetItem(task.main_file.name))
         self.table.setItem(row, 1, QTableWidgetItem(str(task.main_file.parent)))
-        output_subdir = (task.relative_parent / task.main_file.stem).as_posix()
+        output_subdir = (task.relative_parent / archive_base_name(task.main_file)).as_posix()
         self.table.setItem(row, 2, QTableWidgetItem(output_subdir))
         self.table.setItem(row, 3, QTableWidgetItem("等待"))
         self.table.setItem(row, 4, QTableWidgetItem(""))
