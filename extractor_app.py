@@ -1,8 +1,12 @@
 """
-批量解压工具 v2.0.1
-- v2.0.1 修复：分卷输出目录名归一化（不再出现 xxx.part1 这类带分卷残尾的目录名）
-- v2.0.1 修复：分卷包接入密码表撞库；日志与汇总中的口令经 redact_secrets 脱敏
-- v2.0.1 修复：打包内嵌 7z.dll（此前只内嵌 7z.exe，分卷/RAR 解压全部失败）
+批量解压工具 v2.1.0
+- v2.1.0 新功能：「冲突处理」改为「目标已存在时」并真正生效
+  （保留原目录另建副本 / 合并·同名保留旧的 / 合并·同名自动改名 / 覆盖·用新的替换）
+- v2.1.0 界面精简：删除 4 个原本不生效的控件（递归模式、递归解压、智能提升单文件夹、
+  全局去除冗余嵌套）；目录策略由 A/B/C 精简为「保留源文件夹名 / 不保留」两项
+- v2.1.0 修复：伪装包顶层目录名去掉多余后缀（AZA788666.rar.jpg -> AZA788666）
+- v2.0.1 修复：分卷输出目录名归一化、分卷包接入密码表撞库、口令经 redact_secrets 脱敏、
+  打包内嵌 7z.dll（此前只内嵌 7z.exe，分卷/RAR 解压全部失败）
 - 重构解压引擎：解压与目录整理分离
 - 支持旧式 ZIP 分卷、RAR/7z 分卷组（.part1.rar 等）
 - 包装目录折叠 + 同名嵌套合并
@@ -178,11 +182,8 @@ def archive_base_name(path: Path) -> str:
     “仅含单个子目录”的目录，残尾便留了下来。这里统一在命名处归一，
     不再依赖任何会改名/移动目录的折叠逻辑。
 
-    伪装扩展名同理（D-5，2026-09-27 实测发现）：
-        AZA788666.rar.jpg -> AZA788666.rar  （应为 AZA788666）
-        X.zip.jpg         -> X.zip          （应为 X）
-    规则：只有当“从右往左最多跳过 2 段”能露出压缩包扩展名时才剥，
-    避免把 My.Game.v2.jpg 这种正常点名误伤成 My。
+    伪装扩展名不在这里处理——那属于"解压完成后清理顶层目录名"的一步
+    （见 `_strip_top_dir_suffix` / `strip_junk_suffix`），命名阶段只负责分卷与复合扩展名。
     """
     name = path.name
     # xxx.partN.rar / .zip / .7z
@@ -201,15 +202,33 @@ def archive_base_name(path: Path) -> str:
     m = re.match(r'^(.*)\.tar\.(gz|bz2|xz)$', name, re.IGNORECASE)
     if m:
         return m.group(1)
-    # 伪装扩展名：xxx.<压缩包扩展名>.<伪装后缀>[.<伪装后缀>]
-    parts = name.split('.')
-    if len(parts) >= 3:
-        lower = [p.lower() for p in parts]
-        # 从倒数第二段起往前看最多 3 段（即最多跳过 2 个伪装后缀）
-        for i in range(len(parts) - 2, max(len(parts) - 4, 0) - 1, -1):
-            if i > 0 and lower[i] in ('rar', 'zip', '7z', 'tar', 'gz', 'bz2', 'xz'):
-                return '.'.join(parts[:i])
     return path.stem
+
+# 顶层目录名尾部的“不需要的后缀”：压缩包后缀 + 常见伪装后缀。
+# 例：AZA788666.rar.jpg 解压出的顶层目录是 AZA788666.rar → 去掉 .rar → AZA788666。
+JUNK_SUFFIXES = {
+    '.rar', '.zip', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz', '.tbz2', '.txz',
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.txt', '.apk', '.iso',
+}
+
+def strip_junk_suffix(name: str) -> str:
+    """去掉名字尾部所有不需要的后缀（可连续多段）。"""
+    stem = name
+    while True:
+        base, ext = os.path.splitext(stem)
+        if base and ext and ext.lower() in JUNK_SUFFIXES:
+            stem = base
+            continue
+        return stem
+
+# “目标已存在时”的四种处理方式（顺序即界面下拉框顺序）
+CONFLICT_ORDER = ('keep', 'merge_skip', 'merge_rename', 'overwrite')
+CONFLICT_LABELS = {
+    'keep': '保留原目录（另建副本）',
+    'merge_skip': '合并（同名保留旧的）',
+    'merge_rename': '合并（同名自动改名）',
+    'overwrite': '覆盖（用新的替换）',
+}
 
 def find_zip_volume_files(main_zip_path: Path) -> list:
     """返回与主 zip 文件相关的所有分卷文件（不区分大小写）"""
@@ -609,9 +628,8 @@ class ExtractWorker(QThread):
     summary_signal = Signal(dict)
 
     def __init__(self, jobs, target_root, passwords, strategy='B',
-                 recursive=True, smart_flatten=True, delete_intermediate=True,
-                 global_flatten=True, max_depth=10, conflict_policy='keep',
-                 recursion_mode='strict', use_trash=True, parent=None):
+                 delete_intermediate=True, max_depth=10, conflict_policy='keep',
+                 use_trash=True, parent=None):
         super().__init__(parent)
         # jobs 是 (task, row) 元组列表
         valid_jobs = []
@@ -625,13 +643,9 @@ class ExtractWorker(QThread):
         self.target_root = Path(target_root)
         self.passwords = passwords
         self.strategy = strategy
-        self.recursive = recursive
-        self.smart_flatten = smart_flatten
         self.delete_intermediate = delete_intermediate
-        self.global_flatten = global_flatten
         self.max_depth = max_depth
         self.conflict_policy = conflict_policy
-        self.recursion_mode = recursion_mode
         self.use_trash = use_trash
         self._is_cancelled = False
         self.seen_archives = set()
@@ -844,6 +858,108 @@ class ExtractWorker(QThread):
         raise RuntimeError(
             f"分卷包解压失败（已尝试无密码 + {len(passwords)} 个密码）: {redact_secrets(last_error)}")
 
+    def _prepare_top_dir(self, base: Path):
+        """
+        决定本次任务的落点，并让"目标已存在时"的冲突策略真正生效（P-003，2026-09-27）。
+
+        返回 (最终目录, 暂存目录)：
+        · 目标不存在             -> (base, None)，直接解压到 base
+        · 目标存在且选“保留原目录”  -> (unique_dir(base), None)，即原来的 `data(1)` 行为
+        · 目标存在且选合并/覆盖    -> (base, staging)：先解压到暂存目录，再按策略并入 base
+
+        必须走暂存目录：解压器自己会直接覆盖同名文件，若直接解压进已存在的目录，
+        "同名保留旧的/自动改名" 这两种策略就失去意义了。
+        """
+        if not base.exists():
+            return base, None
+        if not base.is_dir():
+            return unique_dir(base), None
+        if self.conflict_policy == 'keep':
+            self.log_signal.emit(f"目标已存在，另建副本: {base.name}")
+            return unique_dir(base), None
+        staging = base.with_name(base.name + '.__incoming__')
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        label = CONFLICT_LABELS.get(self.conflict_policy, self.conflict_policy)
+        self.log_signal.emit(f"目标已存在，按“{label}”并入: {base.name}")
+        return base, staging
+
+    def _collapse_self_named_child(self, dest: Path):
+        """
+        若 `dest` 里唯一的子目录与 `dest` 同名，把它的内容提上来。
+
+        规则与整理阶段的"同名嵌套合并"完全一致，只是提前到并入之前执行：
+        同一次运行里两个同名包时，第一个包的产物还没被整理过（还是 `data/data/`），
+        若不先折叠，第二个包并入时就"看不见"真正的 `data/`，冲突策略便不会触发。
+        """
+        try:
+            items = list(dest.iterdir())
+        except OSError:
+            return
+        if len(items) != 1 or not items[0].is_dir():
+            return
+        sub = items[0]
+        if sub.name.lower() != dest.name.lower():
+            return
+        self._move_all_contents(sub, dest)
+        if not any(sub.iterdir()):
+            try:
+                sub.rmdir()
+            except OSError:
+                pass
+
+    def _finish_staging(self, staging: Path, dest: Path):
+        """
+        把暂存目录的内容按冲突策略并入已存在的目标目录，然后清掉暂存目录。
+
+        若暂存目录里只有一个“与目标同名”的子目录（`data.zip` 解出同名子目录 `data` 的情形），
+        先剥掉这一层再并入——这与正常路径上"同名嵌套合并"的结果保持一致，
+        否则会变成 `data/data/`。
+        """
+        try:
+            if staging.exists():
+                self._collapse_self_named_child(dest)
+                items = list(staging.iterdir())
+                src = staging
+                if len(items) == 1 and items[0].is_dir() \
+                        and items[0].name.lower() == dest.name.lower():
+                    src = items[0]
+                if any(src.iterdir()):
+                    self._move_all_contents(src, dest)
+        except Exception as e:
+            self.log_signal.emit(f"并入目标目录失败 {dest.name}: {e}")
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _strip_top_dir_suffix(self, dest: Path) -> Path:
+        """
+        解压完成后清理本次任务的顶层目录（D-5）：
+
+        只去掉尾部多余的后缀：`AZA788666.rar` -> `AZA788666`（伪装后缀与压缩包后缀都不需要）。
+        **不动目录内部的层级**——`保留原目录` 另建的 `data(1)` 里保持原有嵌套（用户 2026-09-27 明确）。
+
+        改名后必须同步更新 `initial_top_dirs`，否则整理阶段会把这层目录当包装目录折叠掉。
+
+        `AZA788666.rar.jpg` 这类伪装包解出来是 `AZA788666.rar`——伪装后缀与压缩包
+        后缀都不需要，所以直接改顶层目录名。改名后必须同步更新 `initial_top_dirs`，
+        否则整理阶段会把这层目录也当成包装目录折叠掉。
+        """
+        if not dest.exists() or not dest.is_dir():
+            return dest
+        # 1) 去掉尾部多余后缀
+        nice = strip_junk_suffix(dest.name)
+        if nice and nice != dest.name:
+            target = unique_dir(dest.with_name(nice))
+            try:
+                shutil.move(str(dest), str(target))
+                self.log_signal.emit(f"顶层目录改名: {dest.name} -> {target.name}")
+                self.initial_top_dirs.discard(dest)
+                self.initial_top_dirs.add(target)
+                dest = target
+            except Exception as e:
+                self.log_signal.emit(f"顶层目录改名失败 {dest.name}: {e}")
+        return dest
+
     def _delete_file_or_split(self, task: ArchiveTask):
         if task.is_split:
             for vol in task.volumes:
@@ -907,11 +1023,15 @@ class ExtractWorker(QThread):
                         self.status_signal.emit(remaining_row, "已取消")
                     break
 
-                dest = unique_dir(self.target_root / task.relative_parent / archive_base_name(task.main_file))
+                base = self.target_root / task.relative_parent / archive_base_name(task.main_file)
+                dest, staging = self._prepare_top_dir(base)
                 self.initial_top_dirs.add(dest)
                 self.log_signal.emit(f"处理初始任务: {task.main_file.name}")
 
-                self._process_task(task, dest, depth=0)
+                self._process_task(task, staging if staging is not None else dest, depth=0)
+                if staging is not None:
+                    self._finish_staging(staging, dest)
+                dest = self._strip_top_dir_suffix(dest)
 
                 if task.main_file.resolve() in self.failed_archives:
                     self.status_signal.emit(row, "失败")
@@ -955,7 +1075,7 @@ class ExtractWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("批量解压工具 v2.0.1 - 深色主题")
+        self.setWindowTitle("批量解压工具 v2.1.0 - 深色主题")
         self.setMinimumSize(1200, 850)
         self.tasks = []
         self.row_to_task = {}
@@ -999,43 +1119,25 @@ class MainWindow(QMainWindow):
 
         add_layout.addWidget(QLabel("目录策略:"))
         self.strategy_combo = QComboBox()
-        self.strategy_combo.addItem("策略A：保留源结构")
-        self.strategy_combo.addItem("策略B：智能提升")
-        self.strategy_combo.addItem("策略C：保留压缩包目录")
+        self.strategy_combo.addItem("保留源文件夹名")
+        self.strategy_combo.addItem("不保留源文件夹名")
         self.strategy_combo.setCurrentIndex(1)
         add_layout.addWidget(self.strategy_combo)
 
-        add_layout.addWidget(QLabel("递归模式:"))
-        self.recursion_mode_combo = QComboBox()
-        self.recursion_mode_combo.addItem("严格（全为压缩包）")
-        self.recursion_mode_combo.addItem("宽松（存在压缩包）")
-        add_layout.addWidget(self.recursion_mode_combo)
-
-        add_layout.addWidget(QLabel("冲突处理:"))
+        add_layout.addWidget(QLabel("目标已存在时:"))
         self.conflict_combo = QComboBox()
-        self.conflict_combo.addItem("保留原目录")
-        self.conflict_combo.addItem("合并（丢弃同名）")
-        self.conflict_combo.addItem("合并（自动重命名）")
-        self.conflict_combo.addItem("覆盖")
+        for key in CONFLICT_ORDER:
+            self.conflict_combo.addItem(CONFLICT_LABELS[key])
         add_layout.addWidget(self.conflict_combo)
 
         layout.addLayout(add_layout)
 
-        # 选项复选框
+        # 选项复选框（只保留真实生效的两项）
         option_layout = QHBoxLayout()
-        self.recursive_checkbox = QCheckBox("递归解压压缩包内的压缩包")
-        self.recursive_checkbox.setChecked(True)
-        self.smart_flatten_checkbox = QCheckBox("智能提升单文件夹")
-        self.smart_flatten_checkbox.setChecked(True)
-        self.global_flatten_checkbox = QCheckBox("全局去除冗余嵌套")
-        self.global_flatten_checkbox.setChecked(True)
         self.delete_intermediate_checkbox = QCheckBox("删除中间层压缩包文件")
         self.delete_intermediate_checkbox.setChecked(True)
         self.use_trash_checkbox = QCheckBox("删除文件时移入回收站")
         self.use_trash_checkbox.setChecked(True)
-        option_layout.addWidget(self.recursive_checkbox)
-        option_layout.addWidget(self.smart_flatten_checkbox)
-        option_layout.addWidget(self.global_flatten_checkbox)
         option_layout.addWidget(self.delete_intermediate_checkbox)
         option_layout.addWidget(self.use_trash_checkbox)
         option_layout.addStretch()
@@ -1084,25 +1186,6 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # 策略变化联动
-        self.strategy_combo.currentIndexChanged.connect(self.on_strategy_changed)
-        self.on_strategy_changed(self.strategy_combo.currentIndex())
-
-    def on_strategy_changed(self, index):
-        if index == 0:   # A
-            self.smart_flatten_checkbox.setEnabled(False)
-            self.global_flatten_checkbox.setEnabled(False)
-            self.smart_flatten_checkbox.setChecked(False)
-            self.global_flatten_checkbox.setChecked(False)
-        elif index == 1: # B
-            self.smart_flatten_checkbox.setEnabled(True)
-            self.global_flatten_checkbox.setEnabled(True)
-        elif index == 2: # C
-            self.smart_flatten_checkbox.setEnabled(False)
-            self.global_flatten_checkbox.setEnabled(False)
-            self.smart_flatten_checkbox.setChecked(False)
-            self.global_flatten_checkbox.setChecked(False)
-
     # ---------- 配置管理 ----------
     def config_path(self):
         app_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
@@ -1121,7 +1204,6 @@ class MainWindow(QMainWindow):
             'last_add_file_dir': self.config.get('last_add_file_dir', ''),
             'last_add_folder_dir': self.config.get('last_add_folder_dir', ''),
             'strategy': self.strategy_combo.currentIndex(),
-            'recursion_mode': self.recursion_mode_combo.currentIndex(),
             'conflict_policy': self.conflict_combo.currentIndex(),
             'use_trash': self.use_trash_checkbox.isChecked()
         }
@@ -1353,7 +1435,7 @@ class MainWindow(QMainWindow):
         self.table.insertRow(row)
         self.table.setItem(row, 0, QTableWidgetItem(task.main_file.name))
         self.table.setItem(row, 1, QTableWidgetItem(str(task.main_file.parent)))
-        output_subdir = (task.relative_parent / archive_base_name(task.main_file)).as_posix()
+        output_subdir = (task.relative_parent / strip_junk_suffix(archive_base_name(task.main_file))).as_posix()
         self.table.setItem(row, 2, QTableWidgetItem(output_subdir))
         self.table.setItem(row, 3, QTableWidgetItem("等待"))
         self.table.setItem(row, 4, QTableWidgetItem(""))
@@ -1440,15 +1522,11 @@ class MainWindow(QMainWindow):
 
         self.save_config()
 
-        recursive = self.recursive_checkbox.isChecked()
-        smart_flatten = self.smart_flatten_checkbox.isChecked()
-        global_flatten = self.global_flatten_checkbox.isChecked()
         delete_intermediate = self.delete_intermediate_checkbox.isChecked()
         use_trash = self.use_trash_checkbox.isChecked()
         strategy_index = self.strategy_combo.currentIndex()
-        strategy = 'A' if strategy_index == 0 else ('B' if strategy_index == 1 else 'C')
-        recursion_mode = 'strict' if self.recursion_mode_combo.currentIndex() == 0 else 'loose'
-        conflict_policy = ['keep', 'merge_skip', 'merge_rename', 'overwrite'][self.conflict_combo.currentIndex()]
+        strategy = 'A' if strategy_index == 0 else 'B'
+        conflict_policy = CONFLICT_ORDER[self.conflict_combo.currentIndex()]
 
         extract_queue = []
         for row, task in self.row_to_task.items():
@@ -1464,11 +1542,7 @@ class MainWindow(QMainWindow):
             self.worker = ExtractWorker(
                 extract_queue, target, self.passwords,
                 strategy=strategy,
-                recursive=recursive,
-                smart_flatten=smart_flatten,
-                global_flatten=global_flatten,
                 delete_intermediate=delete_intermediate,
-                recursion_mode=recursion_mode,
                 conflict_policy=conflict_policy,
                 use_trash=use_trash
             )
