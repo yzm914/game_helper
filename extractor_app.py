@@ -334,6 +334,20 @@ def run_hidden(cmd, timeout=EXTERNAL_TIMEOUT):
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"外部命令超时（{timeout}秒）: {' '.join(cmd)}")
 
+def redact_secrets(text) -> str:
+    """
+    抹掉文本里可能出现的密码，避免口令进入日志与"完成汇总"。
+
+    必要性：subprocess 的 CalledProcessError 会把**完整命令行**带进异常字符串，
+    而 7z 的密码是以 `-p<password>` 形式出现在命令行里的；7z 自身的 stderr 也可能回显。
+    """
+    s = str(text if text is not None else '')
+    # -p<password>：前面可能是空格、引号、括号或逗号（CalledProcessError 会把每个参数
+    # 用引号包起来），但**不能**把 `D:\-pics` 这类路径误伤，所以排除路径字符。
+    s = re.sub(r"""(?<![A-Za-z0-9_:\.\\])-p\S+""", '-p***', s)
+    s = re.sub(r'(?i)(password\s*[=:]\s*)\S+', r'\1***', s)
+    return s
+
 def extract_with_7z(archive_path: Path, dest_dir: Path, password: str = None):
     seven_zip = find_7z()
     if not seven_zip:
@@ -751,12 +765,12 @@ class ExtractWorker(QThread):
                 self.log_signal.emit(f"正在解压: {fp.name} -> {current_dir}")
                 try:
                     if is_split:
-                        extract_with_7z(fp, current_dir, password=None)
+                        self._extract_split_group(fp, current_dir)
                     else:
                         extract_archive_advanced(fp, current_dir, passwords=self.passwords)
                 except Exception as e:
-                    self.log_signal.emit(f"解压失败 {fp.name}: {e}")
-                    self.failed_archives[fp.resolve()] = str(e)
+                    self.log_signal.emit(f"解压失败 {fp.name}: {redact_secrets(e)}")
+                    self.failed_archives[fp.resolve()] = redact_secrets(e)
                     return
                 if self.delete_intermediate:
                     self._delete_file_or_split(ArchiveTask(fp, Path('.'), vols))
@@ -778,6 +792,40 @@ class ExtractWorker(QThread):
                         vols = find_split_volume_files(entry)
                     tmp_task = ArchiveTask(entry, Path('.'), vols)
                     self._process_task(tmp_task, sub_dest, depth + 1)
+
+    def _extract_split_group(self, main_file: Path, dest_dir: Path):
+        """
+        分卷组整组解压：先用无密码尝试，失败后按密码表逐个撞库（缺陷 D-3）。
+
+        历史行为：分卷分支硬编码 `password=None`，带密码的分卷包必然失败。
+        每次重试前清空目标目录，避免上一次失败留下的半成品与新结果混在一起；
+        日志与失败原因都经 redact_secrets 处理，口令不会进入日志/汇总。
+        """
+        passwords = list(self.passwords or [])
+        attempts = [None] + passwords
+        last_error = None
+        for index, pwd in enumerate(attempts):
+            if self._is_cancelled:
+                raise RuntimeError("任务已取消")
+            if index > 0 and dest_dir.exists():
+                shutil.rmtree(dest_dir, ignore_errors=True)
+            try:
+                extract_with_7z(main_file, dest_dir, password=pwd)
+                if index > 0:
+                    self.log_signal.emit(
+                        f"分卷包密码命中（第 {index}/{len(passwords)} 个）: {main_file.name}")
+                return
+            except Exception as e:
+                last_error = e
+                if index == 0:
+                    if not passwords:
+                        raise
+                    self.log_signal.emit(f"分卷包无密码尝试失败，开始按密码表撞库: {main_file.name}")
+                else:
+                    self.log_signal.emit(
+                        f"分卷包密码尝试 {index}/{len(passwords)} 失败: {main_file.name}")
+        raise RuntimeError(
+            f"分卷包解压失败（已尝试无密码 + {len(passwords)} 个密码）: {redact_secrets(last_error)}")
 
     def _delete_file_or_split(self, task: ArchiveTask):
         if task.is_split:
@@ -807,7 +855,7 @@ class ExtractWorker(QThread):
         try:
             self.log_signal.emit(f"正在解压: {task.main_file.name} -> {dest_dir}")
             if task.is_split:
-                extract_with_7z(task.main_file, dest_dir, password=None)
+                self._extract_split_group(task.main_file, dest_dir)
             else:
                 extract_archive_advanced(task.main_file, dest_dir, passwords=self.passwords)
 
@@ -827,8 +875,8 @@ class ExtractWorker(QThread):
             self._flatten_and_recurse(dest_dir, depth)
 
         except Exception as e:
-            self.log_signal.emit(f"处理异常: {e}")
-            self.failed_archives[key] = str(e)
+            self.log_signal.emit(f"处理异常: {redact_secrets(e)}")
+            self.failed_archives[key] = redact_secrets(e)
 
     def run(self):
         total = len(self.jobs)
