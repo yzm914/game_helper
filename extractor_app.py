@@ -1,5 +1,8 @@
 """
-批量解压工具 v2.0.0
+批量解压工具 v2.0.1
+- v2.0.1 修复：分卷输出目录名归一化（不再出现 xxx.part1 这类带分卷残尾的目录名）
+- v2.0.1 修复：分卷包接入密码表撞库；日志与汇总中的口令经 redact_secrets 脱敏
+- v2.0.1 修复：打包内嵌 7z.dll（此前只内嵌 7z.exe，分卷/RAR 解压全部失败）
 - 重构解压引擎：解压与目录整理分离
 - 支持旧式 ZIP 分卷、RAR/7z 分卷组（.part1.rar 等）
 - 包装目录折叠 + 同名嵌套合并
@@ -938,7 +941,7 @@ class ExtractWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("批量解压工具 v2.0.0 - 深色主题")
+        self.setWindowTitle("批量解压工具 v2.0.1 - 深色主题")
         self.setMinimumSize(1200, 850)
         self.tasks = []
         self.row_to_task = {}
