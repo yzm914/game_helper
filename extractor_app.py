@@ -168,7 +168,7 @@ def is_zip_split_volume(path: Path) -> bool:
 
 def archive_base_name(path: Path) -> str:
     """
-    输出目录名归一化：剥掉分卷（与复合扩展名）标记，返回压缩包的“基名”。
+    输出目录名归一化：剥掉分卷标记、复合扩展名与伪装扩展名，返回压缩包的“基名”。
 
     历史缺陷：目标子目录曾直接用 Path.stem，而 stem 只去掉最后一段扩展名，
     于是分卷输入会把分卷标记留在目录名里——
@@ -177,6 +177,12 @@ def archive_base_name(path: Path) -> str:
     旧版靠“目录折叠”顺手折掉残尾（设计史 L19411），v1.1.0 起折叠只处理
     “仅含单个子目录”的目录，残尾便留了下来。这里统一在命名处归一，
     不再依赖任何会改名/移动目录的折叠逻辑。
+
+    伪装扩展名同理（D-5，2026-09-27 实测发现）：
+        AZA788666.rar.jpg -> AZA788666.rar  （应为 AZA788666）
+        X.zip.jpg         -> X.zip          （应为 X）
+    规则：只有当“从右往左最多跳过 2 段”能露出压缩包扩展名时才剥，
+    避免把 My.Game.v2.jpg 这种正常点名误伤成 My。
     """
     name = path.name
     # xxx.partN.rar / .zip / .7z
@@ -195,6 +201,14 @@ def archive_base_name(path: Path) -> str:
     m = re.match(r'^(.*)\.tar\.(gz|bz2|xz)$', name, re.IGNORECASE)
     if m:
         return m.group(1)
+    # 伪装扩展名：xxx.<压缩包扩展名>.<伪装后缀>[.<伪装后缀>]
+    parts = name.split('.')
+    if len(parts) >= 3:
+        lower = [p.lower() for p in parts]
+        # 从倒数第二段起往前看最多 3 段（即最多跳过 2 个伪装后缀）
+        for i in range(len(parts) - 2, max(len(parts) - 4, 0) - 1, -1):
+            if i > 0 and lower[i] in ('rar', 'zip', '7z', 'tar', 'gz', 'bz2', 'xz'):
+                return '.'.join(parts[:i])
     return path.stem
 
 def find_zip_volume_files(main_zip_path: Path) -> list:
