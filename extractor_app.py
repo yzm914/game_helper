@@ -1,5 +1,7 @@
 """
-批量解压工具 v2.1.0
+批量解压工具 v2.1.1
+- v2.1.1 修复：顶层目录名再去掉“分卷”类标记（C200999_分卷.part1.rar -> C200999；
+  同时支持 -分卷2 / （分卷） / _第1卷 / _卷12 / _part2 / _分割；连写无分隔符的不动）
 - v2.1.0 新功能：「冲突处理」改为「目标已存在时」并真正生效
   （保留原目录另建副本 / 合并·同名保留旧的 / 合并·同名自动改名 / 覆盖·用新的替换）
 - v2.1.0 界面精简：删除 4 个原本不生效的控件（递归模式、递归解压、智能提升单文件夹、
@@ -211,13 +213,44 @@ JUNK_SUFFIXES = {
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.txt', '.apk', '.iso',
 }
 
+# 顶层目录名尾部的“分卷”类标记：C200999_分卷.part1.rar 解出的顶层目录是 C200999_分卷
+# （`.part1.rar` 已在 archive_base_name 里剥掉）→ 再去掉 `_分卷` → C200999。
+# 括号形式（（分卷）、(分卷)）一并支持。
+#
+# 刻意保守，避免误伤标题：
+#   · 必须有分隔符或左括号（`C200999分卷` 这种连写的**不动**）；
+#   · `卷` / `part` 必须带数字（`Game_part`、`最终卷` 不动）；`分卷` / `分割` 本身已是强信号，可无数字。
+VOLUME_MARKER_RE = re.compile(
+    r'^(?P<base>.+?)'
+    r'[\s._\-—·~\(（\[\【]+'
+    r'(?:第?\s*\d*\s*分卷\s*\d*'   # _分卷 / _分卷1 / _2分卷 / _第1分卷 / _第1分卷2
+    r'|分割\s*\d*'               # _分割 / _分割1
+    r'|第\s*\d+\s*卷'             # _第1卷
+    r'|卷\s*\d+'                 # _卷1 / _卷12
+    r'|part\s*\d+'               # _part1 / _part12
+    r')'
+    r'\s*[\)）\]\】]?$',
+    re.IGNORECASE,
+)
+
 def strip_junk_suffix(name: str) -> str:
-    """去掉名字尾部所有不需要的后缀（可连续多段）。"""
+    """
+    去掉名字尾部所有不需要的“后缀”，可连续多段，循环剥到稳定：
+
+    1. 压缩包后缀与常见伪装后缀（`JUNK_SUFFIXES`，形如 `.rar.jpg`）；
+    2. “分卷”类标记（`VOLUME_MARKER_RE`，形如 `_分卷` / `-分卷2` / `（分卷）` / `_第1卷` / `_part1`）。
+
+    两段共用一个循环，才能一次剥净 `AZA788666_分卷.rar.jpg` 这种组合。
+    """
     stem = name
     while True:
         base, ext = os.path.splitext(stem)
         if base and ext and ext.lower() in JUNK_SUFFIXES:
             stem = base
+            continue
+        m = VOLUME_MARKER_RE.match(stem)
+        if m:
+            stem = m.group('base')
             continue
         return stem
 
@@ -1075,7 +1108,7 @@ class ExtractWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("批量解压工具 v2.1.0 - 深色主题")
+        self.setWindowTitle("批量解压工具 v2.1.1 - 深色主题")
         self.setMinimumSize(1200, 850)
         self.tasks = []
         self.row_to_task = {}
